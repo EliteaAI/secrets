@@ -1,0 +1,15 @@
+name: Auto-Increment Version
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+
+jobs:
+  call-reusable-workflow:
+    uses: EliteaAI/actions/.github/workflows/versioneer.yml@main
+    with:
+      metadata_file: "metadata.json"
+      version_key: ".version"
