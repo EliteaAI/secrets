@@ -1,10 +1,20 @@
 from typing import Tuple
 
-from tools import api_tools, VaultClient, auth, config as c
+from tools import api_tools, VaultClient, auth, config as c, register_openapi
 from ..v0.hide import AdminAPI
 
 
 class ProjectAPI(api_tools.APIModeHandler):
+    @register_openapi(
+        name="Hide Secret",
+        description="Move a project secret from regular secrets to hidden secrets.",
+        parameters=[
+            {"name": "project_id", "in": "path", "schema": {"type": "string"},
+             "description": "Project identifier."},
+            {"name": "secret", "in": "path", "schema": {"type": "string"},
+             "description": "Secret name to hide."},
+        ],
+    )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.hide"],
         "recommended_roles": {

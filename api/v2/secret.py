@@ -3,14 +3,26 @@ from urllib.parse import unquote
 from typing import Tuple
 from flask import request
 
-from tools import api_tools, VaultClient, auth, config as c
+from tools import api_tools, VaultClient, auth, config as c, register_openapi
 
 from pydantic.v1 import ValidationError
 from ...pd.secrets import SecretDetail, SecretUpdate, SecretList
 from ..v0.secret import AdminAPI
 
+_PATH_PARAMS = [
+    {"name": "project_id", "in": "path", "schema": {"type": "string"},
+     "description": "Project identifier."},
+    {"name": "secret", "in": "path", "schema": {"type": "string"},
+     "description": "Secret name (URL-encoded if it contains special chars)."},
+]
+
 
 class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
+    @register_openapi(
+        name="Get Secret",
+        description="Get a secret value by name.",
+        parameters=_PATH_PARAMS,
+    )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.unsecret"],
         "recommended_roles": {
@@ -33,6 +45,12 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         result.value = result.value or ""
         return result.dict(), 200
 
+    @register_openapi(
+        name="Update Secret",
+        description="Update an existing secret's name and/or value.",
+        parameters=_PATH_PARAMS,
+        request_body=SecretUpdate,
+    )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.edit"],
         "recommended_roles": {
@@ -58,6 +76,11 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         vault_client.set_secrets(secrets)
         return SecretList(name=parsed.name).dict(), 200
 
+    @register_openapi(
+        name="Delete Secret",
+        description="Delete a secret by name.",
+        parameters=_PATH_PARAMS,
+    )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.delete"],
         "recommended_roles": {
