@@ -1,7 +1,7 @@
 from typing import Tuple, List
 from flask import request
 
-from tools import api_tools, VaultClient, auth, config as c, this
+from tools import api_tools, VaultClient, auth, config as c, this, register_openapi
 
 from pydantic.v1 import ValidationError
 from ...pd.secrets import SecretList, SecretCreate
@@ -9,6 +9,14 @@ from ..v0.secrets import AdminAPI
 
 
 class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
+    @register_openapi(
+        name="List Secrets",
+        description="List all secret names for a project (values are not returned).",
+        parameters=[
+            {"name": "project_id", "in": "path", "schema": {"type": "string"},
+             "description": "Project identifier."},
+        ],
+    )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.list"],
         "recommended_roles": {
@@ -33,6 +41,15 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
 
         return response, 200
 
+    @register_openapi(
+        name="Create Secret",
+        description="Create a new project secret.",
+        parameters=[
+            {"name": "project_id", "in": "path", "schema": {"type": "string"},
+             "description": "Project identifier."},
+        ],
+        request_body=SecretCreate,
+    )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.create"],
         "recommended_roles": {

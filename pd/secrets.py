@@ -22,9 +22,27 @@ class SecretCreate(BaseModel):
             raise ValueError('name must not start or end with a dash')
         return v
 
+    class Config:
+        schema_extra = {
+            "examples": [
+                {
+                    "name": "GITHUB_TOKEN",
+                    "value": "ghp_xxxxxxxxxxxxxxxxxxxx"
+                }
+            ]
+        }
+
 
 class SecretUpdate(SecretCreate):
-    ...
+    class Config:
+        schema_extra = {
+            "examples": [
+                {
+                    "name": "GITHUB_TOKEN",
+                    "value": "ghp_yyyyyyyyyyyyyyyyyyyyyy"
+                }
+            ]
+        }
 
 
 class SecretDetail(SecretList):
