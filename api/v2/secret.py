@@ -22,6 +22,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         name="Get Secret",
         description="Get a secret value by name.",
         parameters=_PATH_PARAMS,
+        available_to_users=True,
     )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.unsecret"],
@@ -50,6 +51,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         description="Update an existing secret's name and/or value.",
         parameters=_PATH_PARAMS,
         request_body=SecretUpdate,
+        available_to_users=True,
     )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.edit"],
@@ -80,6 +82,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         name="Delete Secret",
         description="Delete a secret by name.",
         parameters=_PATH_PARAMS,
+        available_to_users=True,
     )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.delete"],

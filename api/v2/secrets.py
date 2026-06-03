@@ -16,6 +16,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             {"name": "project_id", "in": "path", "schema": {"type": "string"},
              "description": "Project identifier."},
         ],
+        available_to_users=True,
     )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.list"],
@@ -49,6 +50,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
              "description": "Project identifier."},
         ],
         request_body=SecretCreate,
+        available_to_users=True,
     )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.create"],

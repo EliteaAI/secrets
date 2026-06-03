@@ -14,6 +14,7 @@ class ProjectAPI(api_tools.APIModeHandler):
             {"name": "secret", "in": "path", "schema": {"type": "string"},
              "description": "Secret name to hide."},
         ],
+        available_to_users=True,
     )
     @auth.decorators.check_api({
         "permissions": ["configuration.secrets.secret.hide"],
