@@ -1,6 +1,7 @@
 from typing import Tuple
+from flask import request
 
-from tools import api_tools, VaultClient, auth, config as c, register_openapi
+from tools import api_tools, VaultClient, auth, config as c, register_openapi, this
 from ..v0.hide import AdminAPI
 
 
@@ -23,7 +24,19 @@ class ProjectAPI(api_tools.APIModeHandler):
             c.DEFAULT_MODE: {"admin": True, "viewer": False, "editor": True},
         }})
     def post(self, project_id: int, secret: str) -> Tuple[dict, int]:
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         vault_client = VaultClient.from_project(project_id)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return {'message': 'Default secrets API disabled'}, 400
+        #
         secrets = vault_client.get_secrets()
         hidden_secrets = vault_client.get_project_hidden_secrets()
         try:

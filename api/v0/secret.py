@@ -1,7 +1,7 @@
 from typing import Tuple
 from flask import request
 
-from tools import api_tools, VaultClient, auth
+from tools import api_tools, VaultClient, auth, this
 
 
 class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
@@ -13,9 +13,23 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def get(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=R0201,C0111
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         # Check project_id for validity
         project = self.module.context.rpc_manager.call.project_get_or_404(project_id)
         vault_client = VaultClient.from_project(project)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return None, 400
+        #
+        if ignore_default_secret_api:
+            return {"secret": ""}, 200
         # Get secret
         secrets = vault_client.get_secrets()
         _secret = secrets.get(secret) or vault_client.get_project_hidden_secrets().get(secret)
@@ -29,10 +43,22 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def post(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=C0111
-        data = request.json
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         # Check project_id for validity
         project = self.module.context.rpc_manager.call.project_get_or_404(project_id)
         vault_client = VaultClient.from_project(project)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return {'message': 'Default secrets API disabled'}, 400
+        #
+        data = request.json
         # Set secret
         secrets = vault_client.get_secrets()
         secrets[secret] = data["secret"]
@@ -47,10 +73,22 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def put(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=C0111
-        data = request.json
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         # Check project_id for validity
         project = self.module.context.rpc_manager.call.project_get_or_404(project_id)
         vault_client = VaultClient.from_project(project)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return {'message': 'Default secrets API disabled'}, 400
+        #
+        data = request.json
         # Set secret
         secrets = vault_client.get_secrets()
         try:
@@ -69,8 +107,20 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def delete(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=C0111
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         project = self.module.context.rpc_manager.call.project_get_or_404(project_id)
         vault_client = VaultClient.from_project(project)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return None, 400
+        #
         secrets = vault_client.get_secrets()
         if secret in secrets:
             del secrets[secret]
