@@ -3,7 +3,7 @@ from urllib.parse import unquote
 from typing import Tuple
 from flask import request
 
-from tools import api_tools, VaultClient, auth, config as c, register_openapi
+from tools import api_tools, VaultClient, auth, config as c, register_openapi, this
 
 from pydantic.v1 import ValidationError
 from ...pd.secrets import SecretDetail, SecretUpdate, SecretList
@@ -31,7 +31,25 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         }})
     def get(self, project_id: int, secret: str) -> Tuple[dict | None, int]:  # pylint: disable=R0201,C0111
         secret = unquote(secret)
+        #
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         vault_client = VaultClient.from_project(project_id)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return None, 400
+        #
+        if ignore_default_secret_api:
+            result = SecretDetail(name=secret)
+            result.value = ""
+            return result.dict(), 200
+        #
         secrets = vault_client.get_secrets()
         result = SecretDetail(name=secret)
         if secret in secrets:
@@ -59,6 +77,20 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         }})
     def put(self, project_id: int, secret: str) -> Tuple[dict | list, int]:  # pylint: disable=C0111
         secret = unquote(secret)
+        #
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
+        vault_client = VaultClient.from_project(project_id)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return {'message': 'Default secrets API disabled'}, 400
+        #
         raw = dict(request.json)
         raw['name'] = secret
         try:
@@ -66,7 +98,6 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         except ValidationError as e:
             return e.errors(), 400
 
-        vault_client = VaultClient.from_project(project_id)
         secrets = vault_client.get_secrets()
         try:
             del secrets[secret]
@@ -89,7 +120,20 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         }})
     def delete(self, project_id: int, secret: str) -> Tuple[None, int]:  # pylint: disable=C0111
         secret = unquote(secret)
+        #
+        elitea_core_config = this.for_module("elitea_core").descriptor.config
+        default_keys = set(elitea_core_config.get("default_secret_keys", []))
+        #
         vault_client = VaultClient.from_project(project_id)
+        #
+        all_secrets = vault_client.get_all_secrets()
+        #
+        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
+        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        #
+        if ignore_default_secret_api and secret in default_keys:
+            return None, 400
+        #
         secrets = vault_client.get_secrets()
         if secret in secrets:
             del secrets[secret]
