@@ -15,7 +15,7 @@
 """ Module """
 from pylon.core.tools import log  # pylint: disable=E0611,E0401
 from pylon.core.tools import module  # pylint: disable=E0611,E0401
-from tools import theme
+from tools import auth  # pylint: disable=E0401
 
 
 class Module(module.ModuleModel):
@@ -53,38 +53,14 @@ class Module(module.ModuleModel):
         self.descriptor.init_rpcs()
         self.descriptor.init_blueprint()
 
-        theme.register_subsection(
-            "configuration", "secrets",
-            "Secrets",
-            title="Secrets",
-            kind="slot",
-            permissions={
-                "permissions": ["configuration.secrets"],
-                "recommended_roles": {
-                    "administration": {"admin": True, "viewer": False, "editor": False},
-                    "default": {"admin": True, "viewer": False, "editor": False},
-                    "developer": {"admin": True, "viewer": False, "editor": False},
-                }},
-            prefix="secrets_",
-            weight=5,
-        )
-
-        theme.register_mode_subsection(
-            "administration", "configuration",
-            "secrets", "Secrets",
-            title="Secrets",
-            kind="slot",
-            permissions={
-                "permissions": ["configuration.secrets"],
-                "recommended_roles": {
-                    "administration": {"admin": True, "viewer": False, "editor": False},
-                    "default": {"admin": True, "viewer": False, "editor": False},
-                    "developer": {"admin": True, "viewer": False, "editor": False},
-                }},
-            prefix="administration_secrets_",
-            # icon_class="fas fa-server fa-fw",
-            # weight=2,
-        )
+        auth.register_permissions({
+            "permissions": ["configuration.secrets"],
+            "recommended_roles": {
+                "administration": {"admin": True, "viewer": False, "editor": False},
+                "default": {"admin": True, "viewer": False, "editor": False},
+                "developer": {"admin": True, "viewer": False, "editor": False},
+            }
+        })
 
         self.descriptor.init_slots()
 
