@@ -20,6 +20,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="Get Secret",
         description="Get a secret value by name.",
+        mcp_description="Use this tool when you explicitly need the actual value of one known secret for inspection, migration, or debugging. Do not use this tool to discover what secrets exist in a project — use List Secrets first. Do not use this endpoint when only a secret reference such as {{secret.NAME}} is needed, because this call reveals the sensitive value. This is the most sensitive read operation in the secrets API and should only be chosen when value disclosure is truly necessary.",
         parameters=_PATH_PARAMS,
         available_to_users=True,
     )
@@ -66,6 +67,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="Update Secret",
         description="Update an existing secret's name and/or value.",
+        mcp_description="Use this tool when you need to change the stored value of an existing project secret, for example when rotating a token or replacing expired credentials. Do not use this tool to create a new secret that does not already exist — use Create Secret. Do not use this endpoint to list secrets or reveal current secret values. Treat it as a mutating, credential-rotation style action. If the target secret name is wrong or missing, the update will fail.",
         parameters=_PATH_PARAMS,
         request_body=SecretUpdate,
         available_to_users=True,

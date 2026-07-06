@@ -11,6 +11,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="List Secrets",
         description="List all secret names for a project (values are not returned).",
+        mcp_description="Use this tool when you need to see what project secrets exist, build secret-reference dropdowns, or determine whether a secret key is present before reading or updating it. Do not use this tool when you need the actual secret value — use Get Secret for that. Do not use this endpoint to create or modify secrets. This is the safest read endpoint in the secrets API because it exposes names and metadata only, not values.",
         parameters=[
             {"name": "project_id", "in": "path", "schema": {"type": "string"},
              "description": "Project identifier."},
@@ -50,6 +51,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="Create Secret",
         description="Create a new project secret.",
+        mcp_description="Use this tool when you need to add a brand-new project secret, such as an API token, password, or integration credential that does not yet exist in the project. Do not use this tool to change an existing secret value — use Update Secret. Do not use it to inspect secret contents or list available keys. This is the correct endpoint for introducing new secret keys into the project's secret store so they can later be referenced via {{secret.NAME}}.",
         parameters=[
             {"name": "project_id", "in": "path", "schema": {"type": "string"},
              "description": "Project identifier."},
