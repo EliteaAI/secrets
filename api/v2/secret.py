@@ -20,8 +20,6 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="Get Secret",
         description="Get a secret value by name.",
-        mcp_tool=True,
-        mcp_description="Use this tool when you explicitly need the actual value of one known secret for inspection, migration, or debugging. Do not use this tool to discover what secrets exist in a project — use List Secrets first. Do not use this endpoint when only a secret reference such as {{secret.NAME}} is needed, because this call reveals the sensitive value. This is the most sensitive read operation in the secrets API and should only be chosen when value disclosure is truly necessary.",
         parameters=_PATH_PARAMS,
         available_to_users=True,
     )
