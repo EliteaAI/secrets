@@ -37,6 +37,8 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
         ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
 
+        external_access = vault_client.get_external_access()
+
         # Build response with is_default flag for each secret
         response = []
         for secret_name in secrets_dict.keys():
@@ -45,6 +47,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             #
             secret_data = SecretList(name=secret_name).dict()
             secret_data['is_default'] = secret_name in default_keys
+            secret_data['allow_external_access'] = bool(external_access.get(secret_name, False))
             response.append(secret_data)
 
         return response, 200
@@ -92,6 +95,8 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
 
         secrets[parsed.name] = parsed.value
         vault_client.set_secrets(secrets)
+        if parsed.allow_external_access:
+            vault_client.update_external_access(add={parsed.name: True})
         return SecretList(name=parsed.name).dict(), 201
 
 
