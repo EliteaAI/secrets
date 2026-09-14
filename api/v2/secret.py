@@ -104,10 +104,12 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
 
         secrets = vault_client.get_secrets()
         try:
-            del secrets[secret]
+            stored_value = secrets.pop(secret)
         except KeyError:
             return {"message": f"Secret {secret} was not found"}, 400
-        secrets[parsed.name] = parsed.value
+        # An omitted value keeps the stored one, so flipping allow_external_access does not
+        # require the caller to read the secret back out and send it again.
+        secrets[parsed.name] = stored_value if parsed.value is None else parsed.value
         vault_client.set_secrets(secrets)
         #
         flags = vault_client.get_external_access()

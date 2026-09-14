@@ -129,6 +129,34 @@ def test_update_can_unshare():
     assert _flags().get('TOKEN', False) is False
 
 
+def test_sharing_without_resending_the_value_keeps_it():
+    """The UI flips the flag alone, so an omitted value must not blank the secret."""
+    _create({'name': 'TOKEN', 'value': 'v'})
+
+    _body, status = _update('TOKEN', {'allow_external_access': True})
+
+    assert status == 200
+    assert _stored()['TOKEN'] == 'v'
+    assert _flags()['TOKEN'] is True
+
+
+def test_unsharing_without_resending_the_value_keeps_it():
+    _create({'name': 'TOKEN', 'value': 'v', 'allow_external_access': True})
+
+    _update('TOKEN', {'allow_external_access': False})
+
+    assert _stored()['TOKEN'] == 'v'
+    assert _flags().get('TOKEN', False) is False
+
+
+def test_an_explicit_empty_value_still_clears_the_secret():
+    _create({'name': 'TOKEN', 'value': 'v'})
+
+    _update('TOKEN', {'value': ''})
+
+    assert _stored()['TOKEN'] == ''
+
+
 def test_update_of_a_missing_secret_leaves_flags_alone():
     _create({'name': 'OTHER', 'value': 'v', 'allow_external_access': True})
 
