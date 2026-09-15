@@ -3,6 +3,9 @@ from typing import Optional
 
 from pydantic.v1 import BaseModel, validator, constr
 
+# Kept in the ^/$ form because it is published in the OpenAPI schema, whose ECMA-262
+# dialect has no \A or \Z. Python's $ matches just before a final newline, so callers
+# must use fullmatch, not match, or 'TOKEN\n' slips through and splits an audit line.
 SECRET_NAME_REGEX = r'^[A-Za-z0-9_]+$'
 SECRET_NAME_PATTERN = re.compile(SECRET_NAME_REGEX)
 
@@ -22,6 +25,13 @@ class SecretCreate(BaseModel):
     # None means "leave as-is", so updating a value can't silently un-share a secret.
     # Never writing True on absence is what keeps the flag default-off.
     allow_external_access: Optional[bool] = None
+
+    @validator('name')
+    def name_must_match_the_charset_exactly(cls, v):
+        # constr applies the regex with re.match, which tolerates a trailing newline.
+        if not SECRET_NAME_PATTERN.fullmatch(v):
+            raise ValueError('name must contain only letters, digits and underscores')
+        return v
 
     @validator('name')
     def name_must_not_start_or_end_with_dash(cls, v):

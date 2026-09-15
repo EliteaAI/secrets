@@ -19,6 +19,7 @@ from run_tests import (  # noqa: E402  pylint: disable=C0413
 )
 
 private_secret = load_api_module("private_secret")
+pd_secrets = sys.modules["secretsplugin.pd.secrets"]
 
 CALLING_PROJECT = 7
 ALICE_ID = 11
@@ -283,13 +284,30 @@ def test_an_encoded_newline_cannot_forge_an_audit_line():
     assert 'outcome=granted' not in joined
 
 
+def test_a_trailing_newline_alone_is_refused():
+    """`TOKEN%0A` carries no forged content, but `$` would still have let it through."""
+    body, status = _get(secret='TOKEN\n')
+
+    assert (status, body) == (400, {'error': 'invalid_secret_name'})
+    assert '\n' not in ' '.join(StubLog.records)
+
+
+def test_the_shared_charset_rejects_a_trailing_newline_at_creation_too():
+    """Otherwise a name that splits audit lines could be stored in the first place."""
+    with pytest.raises(ValueError):
+        pd_secrets.SecretCreate(name='TOKEN\n')
+
+
 def test_rejected_names_are_not_echoed_into_the_log():
     _get(secret='../../etc/passwd')
 
     assert not any('passwd' in record for record in StubLog.records)
 
 
-@pytest.mark.parametrize('secret', ['', 'has space', 'has-dash', 'dot.dot', 'sub/path', 'quote"'])
+@pytest.mark.parametrize('secret', [
+    '', 'has space', 'has-dash', 'dot.dot', 'sub/path', 'quote"',
+    'TOKEN\n', '\nTOKEN', 'TOKEN\r', 'TOKEN\n\n', 'TOKEN\nMORE',
+])
 def test_names_outside_the_creation_charset_are_refused(secret):
     body, status = _get(secret=secret)
 

@@ -58,7 +58,9 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         # Before the name reaches any log line: an encoded newline in the path would
         # otherwise let the caller append a forged record to the audit log. The charset
         # is the one secret creation already enforces, so nothing valid is rejected.
-        if not SECRET_NAME_PATTERN.match(secret):
+        # fullmatch, not match: Python's $ also matches before a final newline, so match
+        # would accept 'TOKEN\n' and let that newline into the log lines below.
+        if not SECRET_NAME_PATTERN.fullmatch(secret):
             log.info(
                 'Private secret denied: project=%s outcome=invalid_secret_name',
                 project_id,
