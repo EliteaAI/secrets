@@ -268,3 +268,139 @@ def test_audit_log_records_the_refusal_reason():
     _get()
 
     assert any('not_shared' in record for record in StubLog.records)
+
+
+# --- secret name validation -----------------------------------------------------
+
+
+def test_an_encoded_newline_cannot_forge_an_audit_line():
+    """`%250A` in the path decodes to a newline, which would read as a second record."""
+    body, status = _get(secret='MISSING%0Aoutcome=granted user=999')
+
+    assert (status, body) == (400, {'error': 'invalid_secret_name'})
+    joined = ' '.join(StubLog.records)
+    assert '\n' not in joined
+    assert 'outcome=granted' not in joined
+
+
+def test_rejected_names_are_not_echoed_into_the_log():
+    _get(secret='../../etc/passwd')
+
+    assert not any('passwd' in record for record in StubLog.records)
+
+
+@pytest.mark.parametrize('secret', ['', 'has space', 'has-dash', 'dot.dot', 'sub/path', 'quote"'])
+def test_names_outside_the_creation_charset_are_refused(secret):
+    body, status = _get(secret=secret)
+
+    assert (status, body) == (400, {'error': 'invalid_secret_name'})
+
+
+def test_validation_runs_before_the_caller_is_resolved():
+    """An invalid name must not reach a vault or the personal-project lookup."""
+    _get(secret='bad name')
+
+    assert StubVaultClient.opened == []
+
+
+@pytest.mark.parametrize('secret', ['TOKEN', 'my_token_2', 'ABC123', '_leading'])
+def test_names_within_the_creation_charset_are_accepted(secret):
+    StubVaultClient.projects[ALICE_PROJECT] = {
+        'secrets': {secret: 'ok'}, 'external_access': {secret: True},
+    }
+
+    body, status = _get(secret=secret)
+
+    assert (status, body['value']) == (200, 'ok')
+
+
+# --- SDK-facing response contract -----------------------------------------------
+#
+# The SDK maps failures by reading the 'error' key, because status alone is ambiguous:
+# no_personal_project and not_found are both 404. These pin the wire format so a rename
+# on either side breaks here rather than in a code node.
+
+
+def _no_personal_project():
+    _RpcCalls.personal_projects = {}
+
+
+def _not_shared():
+    StubVaultClient.projects[ALICE_PROJECT]['external_access'] = {}
+
+
+def _not_found():
+    StubVaultClient.projects[ALICE_PROJECT] = {'secrets': {}, 'external_access': {'TOKEN': True}}
+
+
+def _unidentified_caller():
+    StubAuth.user = {}
+
+
+def _default_secret():
+    _elitea_core_config({'default_secret_keys': ['TOKEN'], 'ignore_default_secret_api': True})
+
+
+def _invalid_secret_name():
+    return {'secret': 'not valid'}
+
+
+@pytest.mark.parametrize(('arrange', 'expected_status', 'expected_error'), [
+    (_unidentified_caller, 401, 'unidentified_caller'),
+    (_no_personal_project, 404, 'no_personal_project'),
+    (_default_secret, 400, 'default_secret'),
+    (_not_shared, 403, 'not_shared'),
+    (_not_found, 404, 'not_found'),
+    (_invalid_secret_name, 400, 'invalid_secret_name'),
+])
+def test_every_failure_reports_its_reason_under_the_error_key(
+        arrange, expected_status, expected_error,
+):
+    kwargs = arrange() or {}
+
+    body, status = _get(**kwargs)
+
+    assert status == expected_status
+    assert body == {'error': expected_error}
+
+
+def test_the_two_404s_are_told_apart_by_the_body_not_the_status():
+    _no_personal_project()
+    no_project, no_project_status = _get()
+
+    _RpcCalls.personal_projects = {ALICE_ID: ALICE_PROJECT}
+    _not_found()
+    missing, missing_status = _get()
+
+    assert no_project_status == missing_status == 404
+    assert no_project['error'] != missing['error']
+
+
+def test_success_carries_no_error_key():
+    body, _status = _get()
+
+    assert 'error' not in body
+
+
+# --- declared authorization -----------------------------------------------------
+#
+# check_api itself lives in pylon and cannot run in this harness, so these assert what
+# the handlers declare. That turns a dropped decorator or a widened permission into a
+# failure here; enforcement of the decorator itself belongs to pylon's own tests.
+
+
+def test_reading_a_private_secret_requires_the_unsecret_permission():
+    declared = StubAuth.decorators.requirements['ProjectAPI.get']
+
+    assert declared['permissions'] == ['configuration.secrets.secret.unsecret']
+
+
+def test_viewers_are_never_recommended_the_permission():
+    roles = StubAuth.decorators.requirements['ProjectAPI.get']['recommended_roles']
+
+    assert roles, 'both modes must state their recommended roles'
+    assert all(mode['viewer'] is False for mode in roles.values())
+
+
+def test_the_administration_mode_handler_is_guarded_too():
+    assert StubAuth.decorators.requirements.get('AdminAPI.get') is not None

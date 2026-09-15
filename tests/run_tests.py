@@ -85,10 +85,20 @@ class StubAuth:
     sessions = {}
 
     class decorators:  # pylint: disable=invalid-name,too-few-public-methods
+        # qualname -> the descriptor the endpoint passed to check_api. The real decorator
+        # lives in pylon and cannot run here, so recording what each handler *declares* is
+        # what lets a test catch a dropped decorator or a widened permission.
+        requirements = {}
+
         @staticmethod
-        def check_api(*a, **kw):
+        def check_api(descriptor=None, *a, **kw):  # pylint: disable=keyword-arg-before-vararg
             _ = a, kw
-            return lambda func: func
+
+            def decorate(func):
+                StubAuth.decorators.requirements[func.__qualname__] = descriptor
+                return func
+
+            return decorate
 
     @classmethod
     def current_user(cls):

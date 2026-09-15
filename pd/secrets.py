@@ -1,6 +1,10 @@
+import re
 from typing import Optional
 
 from pydantic.v1 import BaseModel, validator, constr
+
+SECRET_NAME_REGEX = r'^[A-Za-z0-9_]+$'
+SECRET_NAME_PATTERN = re.compile(SECRET_NAME_REGEX)
 
 
 class SecretList(BaseModel):
@@ -13,7 +17,7 @@ class SecretList(BaseModel):
 
 
 class SecretCreate(BaseModel):
-    name: constr(regex='^[A-Za-z0-9_]*$', min_length=1)
+    name: constr(regex=SECRET_NAME_REGEX, min_length=1)
     value: Optional[str] = None
     # None means "leave as-is", so updating a value can't silently un-share a secret.
     # Never writing True on absence is what keeps the flag default-off.

@@ -7,7 +7,7 @@ from pylon.core.tools import log
 
 from tools import api_tools, VaultClient, auth, config as c, register_openapi, this
 
-from ...pd.secrets import SecretDetail
+from ...pd.secrets import SECRET_NAME_PATTERN, SecretDetail
 
 _PATH_PARAMS = [
     {"name": "project_id", "in": "path", "schema": {"type": "string"},
@@ -54,6 +54,16 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         }})
     def get(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=R0201,C0111
         secret = unquote(secret)
+        #
+        # Before the name reaches any log line: an encoded newline in the path would
+        # otherwise let the caller append a forged record to the audit log. The charset
+        # is the one secret creation already enforces, so nothing valid is rejected.
+        if not SECRET_NAME_PATTERN.match(secret):
+            log.info(
+                'Private secret denied: project=%s outcome=invalid_secret_name',
+                project_id,
+            )
+            return {"error": "invalid_secret_name"}, 400
         #
         user_id = _resolve_caller_id(project_id)
         if user_id is None:
