@@ -60,6 +60,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
                 return None, 404
             result.value = hidden_secrets[secret]
             result.is_hidden = True
+        result.allow_external_access = bool(vault_client.get_external_access().get(secret, False))
         result.value = result.value or ""
         return result.dict(), 200
 
@@ -103,11 +104,23 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
 
         secrets = vault_client.get_secrets()
         try:
-            del secrets[secret]
+            stored_value = secrets.pop(secret)
         except KeyError:
             return {"message": f"Secret {secret} was not found"}, 400
-        secrets[parsed.name] = parsed.value
+        # An omitted value keeps the stored one, so flipping allow_external_access does not
+        # require the caller to read the secret back out and send it again.
+        secrets[parsed.name] = stored_value if parsed.value is None else parsed.value
         vault_client.set_secrets(secrets)
+        #
+        flags = vault_client.get_external_access()
+        was_shared = bool(flags.get(secret))
+        # An omitted flag keeps the current setting, so a value rotation can't un-share
+        now_shared = was_shared if parsed.allow_external_access is None else parsed.allow_external_access
+        renamed_from = [secret] if parsed.name != secret else []
+        if now_shared:
+            vault_client.update_external_access(add={parsed.name: True}, remove=renamed_from)
+        elif was_shared or flags.get(parsed.name):
+            vault_client.update_external_access(remove=renamed_from + [parsed.name])
         return SecretList(name=parsed.name).dict(), 200
 
     @register_openapi(
@@ -142,6 +155,9 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         if secret in secrets:
             del secrets[secret]
         vault_client.set_secrets(secrets)
+        # A recreated secret must not inherit the deleted one's sharing
+        if vault_client.get_external_access().get(secret):
+            vault_client.update_external_access(remove=[secret])
         return None, 204
 
 

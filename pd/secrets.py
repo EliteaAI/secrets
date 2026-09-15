@@ -1,6 +1,13 @@
+import re
 from typing import Optional
 
 from pydantic.v1 import BaseModel, validator, constr
+
+# Kept in the ^/$ form because it is published in the OpenAPI schema, whose ECMA-262
+# dialect has no \A or \Z. Python's $ matches just before a final newline, so callers
+# must use fullmatch, not match, or 'TOKEN\n' slips through and splits an audit line.
+SECRET_NAME_REGEX = r'^[A-Za-z0-9_]+$'
+SECRET_NAME_PATTERN = re.compile(SECRET_NAME_REGEX)
 
 
 class SecretList(BaseModel):
@@ -13,8 +20,18 @@ class SecretList(BaseModel):
 
 
 class SecretCreate(BaseModel):
-    name: constr(regex='^[A-Za-z0-9_]*$', min_length=1)
+    name: constr(regex=SECRET_NAME_REGEX, min_length=1)
     value: Optional[str] = None
+    # None means "leave as-is", so updating a value can't silently un-share a secret.
+    # Never writing True on absence is what keeps the flag default-off.
+    allow_external_access: Optional[bool] = None
+
+    @validator('name')
+    def name_must_match_the_charset_exactly(cls, v):
+        # constr applies the regex with re.match, which tolerates a trailing newline.
+        if not SECRET_NAME_PATTERN.fullmatch(v):
+            raise ValueError('name must contain only letters, digits and underscores')
+        return v
 
     @validator('name')
     def name_must_not_start_or_end_with_dash(cls, v):
@@ -27,7 +44,8 @@ class SecretCreate(BaseModel):
             "examples": [
                 {
                     "name": "GITHUB_TOKEN",
-                    "value": "ghp_xxxxxxxxxxxxxxxxxxxx"
+                    "value": "ghp_xxxxxxxxxxxxxxxxxxxx",
+                    "allow_external_access": False
                 }
             ]
         }
@@ -39,7 +57,8 @@ class SecretUpdate(SecretCreate):
             "examples": [
                 {
                     "name": "GITHUB_TOKEN",
-                    "value": "ghp_yyyyyyyyyyyyyyyyyyyyyy"
+                    "value": "ghp_yyyyyyyyyyyyyyyyyyyyyy",
+                    "allow_external_access": True
                 }
             ]
         }
@@ -47,4 +66,5 @@ class SecretUpdate(SecretCreate):
 
 class SecretDetail(SecretList):
     is_hidden: Optional[bool] = False
+    allow_external_access: Optional[bool] = False
     value: Optional[str] = None
