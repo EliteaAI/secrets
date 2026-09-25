@@ -46,11 +46,15 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         parameters=_PATH_PARAMS,
         available_to_users=True,
     )
+    # A dedicated permission rather than configuration.secrets.secret.unsecret: viewers must
+    # be able to run pipelines that read their *own* private secret, but granting viewers
+    # unsecret would also let them read every shared-project secret. Role seeding is keyed
+    # on the permission name, so the two cannot share one.
     @auth.decorators.check_api({
-        "permissions": ["configuration.secrets.secret.unsecret"],
+        "permissions": ["configuration.secrets.private_secret.get"],
         "recommended_roles": {
             c.ADMINISTRATION_MODE: {"admin": True, "viewer": False, "editor": True},
-            c.DEFAULT_MODE: {"admin": True, "viewer": False, "editor": True},
+            c.DEFAULT_MODE: {"admin": True, "viewer": True, "editor": True},
         }})
     def get(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=R0201,C0111
         secret = unquote(secret)

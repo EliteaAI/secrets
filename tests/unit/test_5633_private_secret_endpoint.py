@@ -407,17 +407,24 @@ def test_success_carries_no_error_key():
 # failure here; enforcement of the decorator itself belongs to pylon's own tests.
 
 
-def test_reading_a_private_secret_requires_the_unsecret_permission():
+def test_reading_a_private_secret_requires_its_own_permission():
+    """Not unsecret: granting that to viewers would expose every shared-project secret."""
     declared = StubAuth.decorators.requirements['ProjectAPI.get']
 
-    assert declared['permissions'] == ['configuration.secrets.secret.unsecret']
+    assert declared['permissions'] == ['configuration.secrets.private_secret.get']
 
 
-def test_viewers_are_never_recommended_the_permission():
+def test_viewers_are_recommended_the_permission_in_projects():
+    """A viewer running a shared pipeline reads only their own opted-in secret."""
     roles = StubAuth.decorators.requirements['ProjectAPI.get']['recommended_roles']
 
-    assert roles, 'both modes must state their recommended roles'
-    assert all(mode['viewer'] is False for mode in roles.values())
+    assert roles['default'] == {'admin': True, 'viewer': True, 'editor': True}
+
+
+def test_viewers_are_not_recommended_the_permission_in_administration_mode():
+    roles = StubAuth.decorators.requirements['ProjectAPI.get']['recommended_roles']
+
+    assert roles['administration']['viewer'] is False
 
 
 def test_the_administration_mode_handler_is_guarded_too():
