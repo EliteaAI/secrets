@@ -1,6 +1,6 @@
 {
   "name": "Carrier Secrets RestAPI Plugin",
-  "version": "0.17",
+  "version": "0.18",
   "depends_on": [
     "shared"
   ],
