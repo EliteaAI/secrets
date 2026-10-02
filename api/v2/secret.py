@@ -167,7 +167,6 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         "recommended_roles": {
             "administration": {"admin": True, "viewer": False, "editor": False},
             "default": {"admin": True, "viewer": False, "editor": False},
-            "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def get(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=R0201,C0111
         vault_client = VaultClient()
@@ -182,7 +181,6 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         "recommended_roles": {
             "administration": {"admin": True, "viewer": False, "editor": False},
             "default": {"admin": True, "viewer": False, "editor": False},
-            "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def post(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=C0111
         data = request.json
@@ -198,7 +196,6 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         "recommended_roles": {
             "administration": {"admin": True, "viewer": False, "editor": False},
             "default": {"admin": True, "viewer": False, "editor": False},
-            "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def put(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=C0111
         data = request.json
@@ -218,7 +215,6 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         "recommended_roles": {
             "administration": {"admin": True, "viewer": False, "editor": False},
             "default": {"admin": True, "viewer": False, "editor": False},
-            "developer": {"admin": True, "viewer": False, "editor": False},
         }})
     def delete(self, project_id: int, secret: str) -> Tuple[dict, int]:  # pylint: disable=C0111
         vault_client = VaultClient()
