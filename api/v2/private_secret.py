@@ -1,7 +1,6 @@
 from urllib.parse import unquote
 
 from typing import Optional, Tuple
-from flask import request
 
 from pylon.core.tools import log
 
@@ -19,22 +18,7 @@ _PATH_PARAMS = [
 
 
 def _resolve_caller_id(project_id: int) -> Optional[int]:
-    """ Identify the user the request acts on behalf of """
-    received_session = request.headers.get("X-USERSESSION", None)
-    #
-    if received_session and received_session != '-':
-        # Acting-as-user is only honored for callers that proved themselves with X-SECRET
-        vault_client = VaultClient.from_project(project_id)
-        all_secrets = vault_client.get_all_secrets()
-        if "secrets_header_value" not in all_secrets or \
-                request.headers.get("X-SECRET", None) != all_secrets["secrets_header_value"]:
-            return None
-        #
-        session_context = auth.get_referenced_auth_context(received_session)
-        if not session_context:
-            return None
-        return session_context.get("user_id")
-    #
+    """ Identify the user from the request's own auth (personal token or session cookie) """
     return auth.current_user().get("id")
 
 
@@ -91,8 +75,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         #
         elitea_core_config = this.for_module("elitea_core").descriptor.config
         default_keys = set(elitea_core_config.get("default_secret_keys", []))
-        # Unlike the regular secret endpoints, a valid X-SECRET does not lift this guard:
-        # platform-injected secrets must stay unreachable from a shared-project code node.
+        # Platform-injected secrets must stay unreachable from a shared-project code node
         if secret in default_keys and elitea_core_config.get("ignore_default_secret_api", False):
             log.info(
                 'Private secret denied: user=%s project=%s secret=%s outcome=default_secret',

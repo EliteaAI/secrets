@@ -34,7 +34,7 @@ app = Flask(__name__)
 def _reset_stubs():
     StubVaultClient.projects = {
         CALLING_PROJECT: {
-            'secrets': {'TOKEN': 'shared-project-value', 'secrets_header_value': 'right-secret'},
+            'secrets': {'TOKEN': 'shared-project-value'},
         },
         ALICE_PROJECT: {
             'secrets': {'TOKEN': 'alice-value'},
@@ -177,36 +177,22 @@ def test_missing_personal_project_is_reported_distinctly():
     assert body == {'error': 'no_personal_project'}
 
 
-def test_acting_as_user_requires_a_valid_secret_header():
-    StubAuth.sessions = {'session-ref': {'user_id': BOB_ID}}
-
-    body, status = _get(headers={'X-USERSESSION': 'session-ref', 'X-SECRET': 'wrong'})
-
-    assert status == 401
-    assert body == {'error': 'unidentified_caller'}
-
-
-def test_acting_as_user_with_a_valid_secret_header_resolves_that_user():
+def test_a_session_header_cannot_act_as_another_user():
+    # #7065: X-USERSESSION / X-SECRET are gone; the caller is always the request's own user
     StubAuth.user = {'id': ALICE_ID}
     StubAuth.sessions = {'session-ref': {'user_id': BOB_ID}}
 
     body, status = _get(headers={'X-USERSESSION': 'session-ref', 'X-SECRET': 'right-secret'})
 
     assert status == 200
-    assert body['value'] == 'bob-value'
-
-
-def test_unknown_session_reference_is_refused():
-    _body, status = _get(headers={'X-USERSESSION': 'nope', 'X-SECRET': 'right-secret'})
-
-    assert status == 401
-
-
-def test_placeholder_session_falls_back_to_the_current_user():
-    body, status = _get(headers={'X-USERSESSION': '-'})
-
-    assert status == 200
     assert body['value'] == 'alice-value'
+
+
+def test_the_vault_is_not_read_to_identify_the_caller():
+    # Identifying the caller used to read the calling project's vault for the header value
+    _get()
+
+    assert CALLING_PROJECT not in StubVaultClient.opened
 
 
 def test_anonymous_caller_is_refused():
@@ -232,7 +218,7 @@ def test_default_secret_keys_are_blocked_when_the_platform_disables_them():
     assert body == {'error': 'default_secret'}
 
 
-def test_a_valid_secret_header_does_not_lift_the_default_secret_guard():
+def test_legacy_headers_do_not_lift_the_default_secret_guard():
     _elitea_core_config({
         'default_secret_keys': ['TOKEN'],
         'ignore_default_secret_api': True,
