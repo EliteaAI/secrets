@@ -1,5 +1,4 @@
 from typing import Tuple
-from flask import request
 
 from tools import api_tools, VaultClient, auth, config as c, register_openapi, this
 
@@ -28,10 +27,7 @@ class ProjectAPI(api_tools.APIModeHandler):
         #
         vault_client = VaultClient.from_project(project_id)
         #
-        all_secrets = vault_client.get_all_secrets()
-        #
-        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
-        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        ignore_default_secret_api = elitea_core_config.get("ignore_default_secret_api", False)
         #
         if ignore_default_secret_api and secret in default_keys:
             return {'message': 'Default secrets API disabled'}, 400

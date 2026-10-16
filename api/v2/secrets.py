@@ -29,13 +29,11 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         # Get project secrets
         vault_client = VaultClient.from_project(project_id)
         secrets_dict = vault_client.get_secrets()
-        all_secrets = vault_client.get_all_secrets()
 
         # Get default secret keys from elitea_core config
         elitea_core_config = this.for_module("elitea_core").descriptor.config
         default_keys = set(elitea_core_config.get("default_secret_keys", []))
-        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
-        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        ignore_default_secret_api = elitea_core_config.get("ignore_default_secret_api", False)
 
         external_access = vault_client.get_external_access()
 
@@ -80,10 +78,7 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         default_keys = set(elitea_core_config.get("default_secret_keys", []))
         #
         vault_client = VaultClient.from_project(project_id)
-        all_secrets = vault_client.get_all_secrets()
-        #
-        has_correct_secret_header = "secrets_header_value" in all_secrets and request.headers.get("X-SECRET", None) == all_secrets["secrets_header_value"]
-        ignore_default_secret_api = not has_correct_secret_header and elitea_core_config.get("ignore_default_secret_api", False)
+        ignore_default_secret_api = elitea_core_config.get("ignore_default_secret_api", False)
 
         if ignore_default_secret_api and parsed.name in default_keys:
             return {'error': 'Default secrets API disabled'}, 400
