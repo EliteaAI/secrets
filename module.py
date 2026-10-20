@@ -89,9 +89,9 @@ class Module(module.ModuleModel):
                 ("credentials.use", {
                     "administration": {"admin": True, "viewer": False, "editor": False},
                     "default": {"admin": True, "viewer": True, "editor": True}}),
-                ("credentials.reveal", {
-                    "administration": {"admin": False, "viewer": False, "editor": False},
-                    "default": {"admin": False, "viewer": False, "editor": False}}),
+                ("credentials.reveal", {  # recommended to nobody (explicitly: the role model defaults system/super_admin to True)
+                    "administration": {"admin": False, "viewer": False, "editor": False, "system": False, "super_admin": False},
+                    "default": {"admin": False, "viewer": False, "editor": False, "system": False, "super_admin": False}}),
         ):
             auth.register_permissions({"permissions": [permission], "recommended_roles": roles})
 
