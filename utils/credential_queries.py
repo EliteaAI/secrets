@@ -15,10 +15,13 @@ from tools import auth, config as c, this
 
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger, CredentialUseGrant
 from .credential_errors import CredentialTaskError
-from .credential_grants import _BINDING, SUBJECT_PATTERN
+from .credential_grants import _BINDING, ANY_TARGET, SUBJECT_PATTERN
 from .credential_schema import project_tx
 
 MAX_FACT_UUIDS = 64  # what configuration_credential_facts takes in one call
+MAX_USER_IDS = 100  # users asked of the identity service in one call
+MAX_MEMBER_LOOKUP = 1000  # a project with more members does not get its subjects named
+MAX_TITLE_SEARCH = 1000  # references whose configuration titles a search looks at
 IN_FLIGHT = ("intent", "written")
 LIVE_GRANT_STATES = ("pending_approval", "active", "suspended")
 
@@ -93,26 +96,40 @@ def subject_ref_of_user(user_id):
     return subject
 
 
-def _users(user_ids, with_project=None):
-    """``({id: {id, email}}, {subject_ref: {id, email}})`` for the given users (and the members of a project,
-    to name subjects). One lookup; an unavailable identity service gives empty maps."""
-    wanted = {i for i in user_ids if isinstance(i, int)}
-    if with_project is not None:
-        try:
-            wanted |= {int(row["user_id"]) for row in auth.list_project_user_roles(with_project) or []}
-        except Exception as exc:  # pylint: disable=W0703
-            log.error("credential api: project members unavailable (%s)", type(exc).__name__)
-    if not wanted:
-        return {}, {}
+def _list_users(user_ids):
+    """The users with these ids, asked in chunks of at most ``MAX_USER_IDS``; none when there are no ids, and
+    none (logged) when the identity service does not answer."""
+    wanted = sorted({i for i in user_ids if isinstance(i, int) and not isinstance(i, bool)})
+    found = []
     try:
-        found = auth.list_users(user_ids=sorted(wanted)) or []
+        for start in range(0, len(wanted), MAX_USER_IDS):
+            found.extend(auth.list_users(user_ids=wanted[start:start + MAX_USER_IDS]) or [])
     except Exception as exc:  # pylint: disable=W0703
         log.error("credential api: users unavailable (%s)", type(exc).__name__)
-        return {}, {}
+        return []
+    return found
+
+
+def _subject_of(user):
+    return f"idp:{user.get('idp_tid')}:{user.get('idp_oid')}" if user.get("idp_tid") and user.get("idp_oid") else None
+
+
+def _users(user_ids, subjects_of_project=None):
+    """``({id: {id, email}}, {subject_ref: {id, email}})`` for the given users. With ``subjects_of_project`` the
+    members of that project are looked up too, to name the subjects of grants (the grant stores the subject, not the
+    user id, and the identity service has no lookup by subject: at most ``MAX_MEMBER_LOOKUP`` members)."""
+    wanted = set(user_ids)
+    if subjects_of_project is not None:
+        try:
+            members = {int(row["user_id"]) for row in auth.list_project_user_roles(subjects_of_project) or []}
+        except Exception as exc:  # pylint: disable=W0703
+            log.error("credential api: project members unavailable (%s)", type(exc).__name__)
+            members = set()
+        if len(members) <= MAX_MEMBER_LOOKUP:
+            wanted |= members
+    found = _list_users(wanted)
     by_id = {u["id"]: {"id": u["id"], "email": u.get("email")} for u in found}
-    by_subject = {f"idp:{u.get('idp_tid')}:{u.get('idp_oid')}": by_id[u["id"]]
-                  for u in found if u.get("idp_tid") and u.get("idp_oid")}
-    return by_id, by_subject
+    return by_id, {_subject_of(u): by_id[u["id"]] for u in found if _subject_of(u)}
 
 
 def _user(by_id, user_id):
@@ -141,7 +158,8 @@ def _owner_id(custodian_ref):
 
 def _present_references(project_id, rows):
     facts = _facts(project_id, [row.configuration_uuid for row in rows])
-    users, _ = _users({i for row in rows for i in (row.created_by, row.approved_by, _owner_id(row.custodian_ref))})
+    users, _ = _users({i for row in rows for i in (row.created_by, row.approved_by, _owner_id(row.custodian_ref))
+                       if i is not None})
     present = []
     for row in rows:
         fact = facts.get(str(row.configuration_uuid))
@@ -169,6 +187,17 @@ def _present_references(project_id, rows):
     return present
 
 
+def _references_titled(session, project_id, search):
+    """Ids of the project's references whose configuration title contains ``search`` (case-insensitive). The titles
+    come from the batched facts lookup, for at most ``MAX_TITLE_SEARCH`` references, and only when a search is made."""
+    rows = session.execute(select(_REF.id, _REF.configuration_uuid).where(_REF.project_id == project_id)
+                           .limit(MAX_TITLE_SEARCH)).all()
+    facts = _facts(project_id, [row.configuration_uuid for row in rows])
+    needle = search.lower()
+    titles = {row.id: (facts.get(str(row.configuration_uuid)) or {}).get("title") for row in rows}
+    return [ref_id for ref_id, title in titles.items() if title and needle in str(title).lower()]
+
+
 def list_references(project_id, page, filters):
     """``{total, rows}`` of the project's references. ``filters``: state, ownership_class, store_kind, owner_user_id."""
     conditions = [_REF.project_id == project_id]
@@ -177,9 +206,11 @@ def list_references(project_id, page, filters):
             conditions.append(getattr(_REF, name) == filters[name])
     if filters.get("owner_user_id"):
         conditions.append(_REF.custodian_ref["user_id"].as_integer() == filters["owner_user_id"])
-    if page.search:
-        conditions.append(_REF.provider.ilike(_like(page.search), escape="\\"))
     with project_tx(project_id) as session:
+        if page.search:  # the provider, or the title of the configuration (known to the configurations plugin only)
+            by_title = _references_titled(session, project_id, page.search)
+            like = _REF.provider.ilike(_like(page.search), escape="\\")
+            conditions.append(or_(like, _REF.id.in_(by_title)) if by_title else like)
         total = session.execute(select(func.count()).select_from(_REF).where(*conditions)).scalar_one()
         rows = session.execute(
             select(*_REFERENCE_COLUMNS).where(*conditions).order_by(*_order(REFERENCE_SORTS, page, _REF))
@@ -237,12 +268,16 @@ def _grant_lookups(project_id, rows):
     return bindings, applications, versions, tools, references
 
 
-def _present_grants(project_id, rows):
+def _present_grants(project_id, rows, known_subject=None):
+    """``known_subject``: ``(subject_ref, user_id)`` when the list is for one user (no member lookup for that name)."""
     bindings, applications, versions, tools, references = _grant_lookups(project_id, rows)
     facts = _facts(project_id, [ref.configuration_uuid for ref in references.values()])
-    has_users = any(not row.subject_ref.startswith("mandate:") for row in rows)
-    users, subjects = _users({i for row in rows for i in (row.created_by, row.approved_by)},
-                             with_project=project_id if has_users else None)
+    ids = {i for row in rows for i in (row.created_by, row.approved_by)}
+    unknown = {row.subject_ref for row in rows if not row.subject_ref.startswith("mandate:")}
+    if known_subject:
+        ids.add(known_subject[1])
+        unknown.discard(known_subject[0])
+    users, subjects = _users(ids, subjects_of_project=project_id if unknown else None)
     present = []
     for row in rows:
         binding = bindings.get(row.agent_binding_ref)
@@ -275,7 +310,9 @@ def _present_grants(project_id, rows):
 def list_grants(project_id, page, filters):
     """``{total, rows}`` of the project's grants. ``filters``: state, agent_binding_ref, credential_ref, toolkit_id,
     subject_user_id (resolved to its subject here; a user that cannot have a subject has no grants)."""
-    conditions = [_GRANT.project_id == project_id]
+    # grants for any other target cannot be acted on by the lifecycle functions, so they are not listed
+    conditions = [_GRANT.project_id == project_id, _GRANT.target_ref == ANY_TARGET]
+    known_subject = None
     if filters.get("state"):
         conditions.append(_GRANT.state == filters["state"])
     if filters.get("agent_binding_ref"):
@@ -286,7 +323,9 @@ def list_grants(project_id, page, filters):
         conditions.append(_GRANT.toolkit_instance_id == str(filters["toolkit_id"]))
     if filters.get("subject_user_id"):
         try:
-            conditions.append(_GRANT.subject_ref == subject_ref_of_user(filters["subject_user_id"]))
+            subject = subject_ref_of_user(filters["subject_user_id"])
+            known_subject = (subject, filters["subject_user_id"])
+            conditions.append(_GRANT.subject_ref == subject)
         except CredentialTaskError as exc:
             if exc.code not in ("SUBJECT_NOT_FOUND", "SUBJECT_UNLINKED"):
                 raise
@@ -300,4 +339,4 @@ def list_grants(project_id, page, filters):
         rows = session.execute(
             select(*_GRANT_COLUMNS).where(*conditions).order_by(*_order(GRANT_SORTS, page, _GRANT))
             .limit(page.limit).offset(page.offset)).all()
-    return {"total": total, "rows": _present_grants(project_id, rows)}
+    return {"total": total, "rows": _present_grants(project_id, rows, known_subject)}

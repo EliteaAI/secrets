@@ -15,13 +15,14 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             {"name": "grant_id", "in": "path", "schema": {"type": "string", "format": "uuid"},
              "description": "Credential use grant identifier."},
         ],
+        request_body=api.GrantAction,
         mcp_tool=False,
         available_to_users=False,
     )
     # Any of the two opens the endpoint; the action then needs the one permission it names
     @auth.decorators.check_api({"permissions": [api.MANAGE, api.APPROVE], "recommended_roles": api.OPERATE_ROLES})
     def post(self, project_id: int, grant_id, **kwargs):  # pylint: disable=C0111
-        return api.respond(api.grant_action, project_id, grant_id)
+        return api.respond(self.module, api.grant_action, project_id, grant_id)
 
 
 class API(api_tools.APIBase):  # pylint: disable=R0903,C0111

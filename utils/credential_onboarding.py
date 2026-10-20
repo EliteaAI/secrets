@@ -445,10 +445,11 @@ _ACTIONS = {
 }
 
 
-def run_reference_action(values, actor_user_id=0):
+def run_reference_action(values, actor_user_id=0, audit_code=False):
     """Run one reference action from parsed ``values`` (the admin task and the REST API both end here). Returns
     a result dict, or ``{"error": ..., "code": ...}`` with nothing written (an import or probe that failed after
-    it began has recorded the failure)."""
+    it began has recorded the failure). The task reports a down audit trail as ``FAILED``; ``audit_code`` (the
+    REST API) reports it as ``AUDIT_UNAVAILABLE``."""
     try:
         if not values["dry_run"]:
             require_actor(actor_user_id)
@@ -461,7 +462,8 @@ def run_reference_action(values, actor_user_id=0):
         return {"error": f"{exc.reason_code}: {exc}", "code": exc.reason_code}
     except Exception as exc:  # pylint: disable=W0703
         log.error("manage_credential_reference: failed (%s)", type(exc).__name__)
-        return {"error": "failed; if an import was running, run reconcile_credential_store", "code": "FAILED"}
+        code = "AUDIT_UNAVAILABLE" if audit_code and isinstance(exc, audit.AuditUnavailable) else "FAILED"
+        return {"error": "failed; if an import was running, run reconcile_credential_store", "code": code}
 
 
 def manage_reference(param, actor_user_id=0):

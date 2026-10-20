@@ -254,9 +254,10 @@ def _move(values, actor):
 _ACTIONS = {"create": _create, "approve": _approve, "suspend": _move, "resume": _move, "revoke": _move}
 
 
-def run_grant_action(values, actor_user_id=0):
+def run_grant_action(values, actor_user_id=0, audit_code=False):
     """Run one grant action from parsed ``values`` (the admin task and the REST API both end here). Returns a
-    result dict, or ``{"error": ..., "code": ...}`` with nothing written."""
+    result dict, or ``{"error": ..., "code": ...}`` with nothing written. The task reports a down audit trail as
+    ``FAILED``; ``audit_code`` (the REST API) reports it as ``AUDIT_UNAVAILABLE``."""
     try:
         if not values["dry_run"]:
             require_actor(actor_user_id)
@@ -267,7 +268,8 @@ def run_grant_action(values, actor_user_id=0):
         return {"error": f"{exc.reason_code}: {exc}", "code": exc.reason_code}
     except Exception as exc:  # pylint: disable=W0703
         log.error("manage_credential_grant: failed (%s)", type(exc).__name__)
-        return {"error": "failed; nothing was changed (is the audit trail available?)", "code": "FAILED"}
+        code = "AUDIT_UNAVAILABLE" if audit_code and isinstance(exc, audit.AuditUnavailable) else "FAILED"
+        return {"error": "failed; nothing was changed (is the audit trail available?)", "code": code}
 
 
 def manage_grant(param, actor_user_id=0):
@@ -285,6 +287,7 @@ def grant_key_by_id(project_id, grant_id):
     with project_tx(project_id) as session:
         grant = session.execute(select(CredentialUseGrant).where(
             CredentialUseGrant.id == uuid.UUID(str(grant_id)), CredentialUseGrant.project_id == project_id,
+            CredentialUseGrant.target_ref == ANY_TARGET,  # the row ``_find_grant`` will find again
         )).scalar_one_or_none()
         if grant is None:
             raise CredentialTaskError("GRANT_NOT_FOUND")

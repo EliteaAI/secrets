@@ -5,10 +5,15 @@ The state machines are not here. Every change goes through ``run_reference_actio
 same functions the admin tasks end in, so a REST call writes the same rows and the same audit event as the task.
 Request bodies are strict: unknown fields, wrong types and a raw ``subject_ref`` are refused (400) before anything
 runs, and no reply contains a value from the request, a store locator or secret material.
+
+Not in this slice (PR 6, personal references): ``owner_user_id`` on create and ``check_connection`` on probe. Both are
+refused as unknown fields for now.
 """
 import json
+import re
 import uuid
-from typing import ClassVar, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, ClassVar, Optional
 
 from flask import request
 from pydantic.v1 import BaseModel, Extra, StrictInt, StrictStr, ValidationError, root_validator, validator
@@ -22,18 +27,21 @@ from .credential_grants import grant_key_by_id, parse_valid_until, run_grant_act
 from .credential_onboarding import (
     ACTIONS as REFERENCE_ACTIONS, ONBOARD_OWNERSHIP_CLASSES, ONBOARD_STORE_KINDS, run_reference_action,
 )
-from .credential_state import MAX_REF_LENGTH
 from ..models.credential_governance import GRANT_STATES, OWNERSHIP_CLASSES, REFERENCE_STATES, STORE_KINDS
 
 VIEW, MANAGE, PROBE, APPROVE = "credentials.view", "credentials.manage", "credentials.probe", "credentials.approve"
-_OPERATORS = {"super_admin": True, "admin": True, "viewer": False, "editor": False}
+# ``system`` is named everywhere: the role model defaults it to true, and these permissions are for operators only
+_OPERATORS = {"system": False, "super_admin": True, "admin": True, "viewer": False, "editor": False}
 # Read access exists in administration mode only; the project (default) mode has no handler in slice 1
 VIEW_ROLES = {
     "administration": dict(_OPERATORS),
     "default": {"system": False, "super_admin": False, "admin": False, "viewer": False, "editor": False},
 }
 # What the permission registry (module.py) and the handlers recommend for manage, probe and approve
-OPERATE_ROLES = {"administration": dict(_OPERATORS), "default": {"admin": True, "viewer": False, "editor": False}}
+OPERATE_ROLES = {
+    "administration": dict(_OPERATORS),
+    "default": {"system": False, "admin": True, "viewer": False, "editor": False},
+}
 REFERENCE_ACTION_PERMISSION = {
     "import": MANAGE, "activate": MANAGE, "suspend": MANAGE, "resume": MANAGE, "retire": MANAGE,
     "probe": PROBE, "approve": APPROVE,
@@ -42,35 +50,48 @@ GRANT_ACTION_PERMISSION = {"approve": APPROVE, "suspend": MANAGE, "resume": MANA
 
 MAX_BODY_BYTES = 8192
 DEFAULT_LIMIT, MAX_LIMIT, MAX_SEARCH = 20, 100, 128
+MAX_OFFSET = 10_000_000
+MAX_INT32 = 2**31 - 1  # ids and limits are compared with 32-bit columns; a larger value would overflow in the database
+MAX_GRANT_VALIDITY_DAYS = 365
+REFERENCE_TEXT = re.compile(r"[A-Za-z0-9._:/@-]{1,128}")  # approval_ref and policy_revision, as in the mandate task
 SORT_ORDERS = ("asc", "desc")
 
 STATUS = {
     400: ("INVALID_REQUEST", "APPROVAL_REQUIRED", "CONFIGURATION_NOT_ELIGIBLE", "UNSUPPORTED_STORE_KIND",
           "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH"),
-    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED"),
-    404: ("REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
+    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED"),
+    404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
           "IMPORT_IN_FLIGHT", "CONFIGURATION_CHANGED", "MATERIAL_MISMATCH", "NO_SECRET_FIELDS", "SECRET_UNRESOLVED",
-          "MANDATE_INACTIVE", "SUBJECT_UNLINKED"),
+          "MANDATE_INACTIVE", "SUBJECT_UNLINKED", "STORE_VERSION_CONFLICT"),
     413: ("REQUEST_TOO_LARGE",),
-    503: ("DEPENDENCY_UNAVAILABLE",),
+    503: ("DEPENDENCY_UNAVAILABLE", "AUDIT_UNAVAILABLE"),
 }
 _STATUS_OF = {code: status for status, codes in STATUS.items() for code in codes}
 
 
 def status_of(code):
-    """The HTTP status of a refusal code: the store's codes are 503, anything unlisted is 500."""
-    if isinstance(code, str) and code.startswith("STORE_"):
-        return 503
-    return _STATUS_OF.get(code, 500)
+    """The HTTP status of a refusal code: a store code is 503 unless listed (denied, version conflict), anything
+    else unlisted is 500."""
+    if code in _STATUS_OF:
+        return _STATUS_OF[code]
+    return 503 if isinstance(code, str) and code.startswith("STORE_") else 500
 
 
 # --- replies -----------------------------------------------------------------------------------------------------
 
-def error_reply(code, message=None):
+def error_reply(code, message=None, status=None):
     """``({error, code}, status)`` with a fixed message that holds no id or request value."""
-    return {"error": message or MESSAGES.get(code) or MESSAGES["FAILED"], "code": code}, status_of(code)
+    return {"error": message or MESSAGES.get(code) or MESSAGES["FAILED"], "code": code}, status or status_of(code)
+
+
+class UnsupportedMediaType(CredentialTaskError):
+    """A request that is not JSON: ``INVALID_REQUEST`` with status 415."""
+
+    def __init__(self):
+        super().__init__("INVALID_REQUEST")
+        self.status = 415
 
 
 def result_reply(result, created=False):
@@ -91,12 +112,26 @@ def result_reply(result, created=False):
     return body, 201 if created else 200
 
 
-def respond(handler, *args):
-    """Run a handler body; refusals and unexpected failures become replies (a failure logs its type only)."""
+def require_project(module, project_id):
+    """The project must exist (one lookup); an id no 32-bit column can hold does not."""
+    if project_id > MAX_INT32:
+        raise CredentialTaskError("NOT_FOUND")
     try:
-        return handler(*args)
+        project = module.context.rpc_manager.call.project_get_by_id(project_id=project_id)
+    except Exception:  # pylint: disable=W0703
+        raise CredentialTaskError("DEPENDENCY_UNAVAILABLE") from None
+    if not project:
+        raise CredentialTaskError("NOT_FOUND")
+
+
+def respond(module, handler, project_id, *args):
+    """Run a handler body for an existing project; refusals and unexpected failures become replies (a failure
+    logs its type only)."""
+    try:
+        require_project(module, project_id)
+        return handler(project_id, *args)
     except CredentialTaskError as exc:
-        return error_reply(exc.code)
+        return error_reply(exc.code, status=getattr(exc, "status", None))
     except Exception as exc:  # pylint: disable=W0703
         log.error("credential api: failed (%s)", type(exc).__name__)
         return error_reply("FAILED")
@@ -124,8 +159,11 @@ def require_permission(permission, project_id):
 # --- request bodies ----------------------------------------------------------------------------------------------
 
 def read_json_object():
-    """The JSON object of the request, read with a size bound before it is parsed: the declared length is checked
-    first, and the server is told to stop reading at the bound where it supports that."""
+    """The JSON object of the request. Only a JSON content type is read (a form or text/plain post is refused with
+    415), and the size is bound before parsing: the declared length is checked first, and the server is told to stop
+    reading at the bound (a body without a length is read up to it)."""
+    if not request.is_json:
+        raise UnsupportedMediaType()
     if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
         raise CredentialTaskError("REQUEST_TOO_LARGE")
     request.max_content_length = MAX_BODY_BYTES
@@ -152,10 +190,32 @@ def _uuid_text(value):
 
 
 def _reference_text(value):
-    value = value.strip()
-    if not value or len(value) > MAX_REF_LENGTH:
+    if not REFERENCE_TEXT.fullmatch(value):
         raise ValueError("bad reference")
     return value
+
+
+def _bounded_id(value):
+    if not 0 < value <= MAX_INT32:
+        raise ValueError("bad id")
+    return value
+
+
+def _valid_until(value):
+    """The aware UTC time for a ``valid_until`` text: ISO-8601 with an offset, in the future, at most
+    ``MAX_GRANT_VALIDITY_DAYS`` ahead, and representable after the conversion to UTC. Parsed once, here."""
+    if not isinstance(value, str):
+        raise ValueError("not a time")
+    try:
+        until, problem = parse_valid_until(value)
+        if problem:
+            raise ValueError("bad time")
+        until = until.astimezone(timezone.utc)
+        if until > datetime.now(timezone.utc) + timedelta(days=MAX_GRANT_VALIDITY_DAYS):
+            raise ValueError("too far ahead")
+    except OverflowError:
+        raise ValueError("bad time") from None
+    return until
 
 
 class _Body(BaseModel):
@@ -220,21 +280,15 @@ class GrantCreate(_Body):
     toolkit_id: StrictInt
     credential_ref: StrictStr
     subject_user_id: StrictInt
-    valid_until: Optional[StrictStr] = None
+    valid_until: Optional[Any] = None
 
     _uuids = validator("agent_binding_ref", "credential_ref", allow_reuse=True)(_uuid_text)
 
-    @validator("toolkit_id", "subject_user_id")
-    def _positive(cls, value):  # pylint: disable=E0213
-        if value <= 0:
-            raise ValueError("must be positive")
-        return value
+    _ids = validator("toolkit_id", "subject_user_id", allow_reuse=True)(_bounded_id)
 
     @validator("valid_until")
-    def _future(cls, value):  # pylint: disable=E0213
-        if value is not None and parse_valid_until(value)[1]:
-            raise ValueError("needs an offset and must be in the future")
-        return value
+    def _time(cls, value):  # pylint: disable=E0213
+        return None if value is None else _valid_until(value)
 
 
 class GrantAction(_Approval):
@@ -259,7 +313,7 @@ def _int_arg(args, name):
         number = int(value)
     except ValueError:
         raise CredentialTaskError("INVALID_REQUEST") from None
-    if number <= 0:
+    if not 0 < number <= MAX_INT32:
         raise CredentialTaskError("INVALID_REQUEST")
     return number
 
@@ -283,24 +337,28 @@ def _uuid_arg(args, name):
         raise CredentialTaskError("INVALID_REQUEST") from None
 
 
+def _page_number(args, name, default, bound):
+    """A paging number: not a number gives the default, a negative one 0, one above ``bound`` is refused."""
+    try:
+        number = int(args.get(name, default))
+    except ValueError:
+        return default
+    if number > bound:
+        raise CredentialTaskError("INVALID_REQUEST")
+    return max(number, 0)
+
+
 def parse_page(args, sorts):
     """``Page``: limit (default 20, at most 100), offset, search (at most 128 characters), a whitelisted ``sort_by``
     (anything else sorts by ``updated_at``) and ``sort_order``."""
-    try:
-        limit = int(args.get("limit", DEFAULT_LIMIT))
-    except ValueError:
-        limit = DEFAULT_LIMIT
-    try:
-        offset = int(args.get("offset", 0))
-    except ValueError:
-        offset = 0
+    limit, offset = _page_number(args, "limit", DEFAULT_LIMIT, MAX_INT32), _page_number(args, "offset", 0, MAX_OFFSET)
     search = (args.get("search") or "").strip() or None
     if search is not None and len(search) > MAX_SEARCH:
         raise CredentialTaskError("INVALID_REQUEST")
     sort_by = args.get("sort_by")
     order = args.get("sort_order")
     return queries.Page(
-        limit=min(max(limit, 1), MAX_LIMIT), offset=max(offset, 0), search=search,
+        limit=min(max(limit, 1), MAX_LIMIT), offset=offset, search=search,
         sort_by=sort_by if sort_by in sorts else "updated_at", sort_order=order if order in SORT_ORDERS else "desc")
 
 
@@ -350,7 +408,7 @@ def create_reference(project_id):
     body = parse_body(ReferenceCreate, read_json_object())
     values = {"project_id": project_id, "action": "create", "configuration_uuid": body.configuration_uuid,
               "store_kind": body.store_kind, "ownership_class": body.ownership_class, "dry_run": False}
-    return result_reply(run_reference_action(values, actor_id()), created=True)
+    return result_reply(run_reference_action(values, actor_id(), audit_code=True), created=True)
 
 
 def reference_action(project_id, ref_id):
@@ -359,7 +417,7 @@ def reference_action(project_id, ref_id):
     values = {"project_id": project_id, "action": body.action, "ref": str(ref_id), "dry_run": False}
     if body.action == "approve":
         values.update(approval_ref=body.approval_ref, policy_revision=body.policy_revision)
-    return result_reply(run_reference_action(values, actor_id()))
+    return result_reply(run_reference_action(values, actor_id(), audit_code=True))
 
 
 def list_grants(project_id):
@@ -373,8 +431,8 @@ def create_grant(project_id):
               "toolkit_id": body.toolkit_id, "ref": body.credential_ref,
               "subject_ref": queries.subject_ref_of_user(body.subject_user_id), "dry_run": False}
     if body.valid_until is not None:
-        values["valid_until"] = parse_valid_until(body.valid_until)[0]
-    return result_reply(run_grant_action(values, actor_id()), created=True)
+        values["valid_until"] = body.valid_until
+    return result_reply(run_grant_action(values, actor_id(), audit_code=True), created=True)
 
 
 def grant_action(project_id, grant_id):
@@ -384,4 +442,4 @@ def grant_action(project_id, grant_id):
               **grant_key_by_id(project_id, grant_id)}
     if body.action == "approve":
         values.update(approval_ref=body.approval_ref, policy_revision=body.policy_revision)
-    return result_reply(run_grant_action(values, actor_id()))
+    return result_reply(run_grant_action(values, actor_id(), audit_code=True))

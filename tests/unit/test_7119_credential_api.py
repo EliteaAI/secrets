@@ -5,16 +5,18 @@ fakes the task tests use, plus a small identity service and a permission switch.
 here: what each endpoint declares to it is asserted from the recorded descriptors, and the per-action permission
 the handlers check themselves is exercised with the permission set the fake hands out.
 """
+import io
 import json
 import types
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from flask import Flask
+from flask import Flask, g
 
 from fixtures.api_loader import load_api_module
 from fixtures.governance import APPLICATION, BINDING, FIXTURE_VALUE, TOOL, TOOL_MAPPING, VERSION
+from fixtures.permissions import effective_roles
 from run_tests import StubAuth, StubLog
 
 app = Flask(__name__)
@@ -43,8 +45,12 @@ class Rest:
         }
         self.members = [CREATOR, APPROVER, MEMBER, UNLINKED]
         self.permissions = set(ALL_PERMISSIONS)
+        self.token_permissions = set()
         self.permission_calls = []
         self.identity_down = False
+        self.projects = {P1, P2}
+        self.project_rpc_down = False
+        self.user_calls, self.member_calls = [], 0
         self.onboarding = gov.module("utils.credential_onboarding")
         self.grants = gov.module("utils.credential_grants")
         self.set_actor(CREATOR)
@@ -62,6 +68,7 @@ class Rest:
             return dict(self.users[user_id])
 
         def list_users(user_ids=None):
+            self.user_calls.append(list(user_ids or []))
             if self.identity_down:
                 raise ConnectionError("down")
             return [dict(self.users[i]) for i in (user_ids or self.users) if i in self.users]
@@ -70,23 +77,38 @@ class Rest:
             self.permission_calls.append((mode, project_id))
             if self.permissions is None:
                 raise RuntimeError("auth down")
+            if getattr(getattr(g, "auth", None), "type", "user") == "token":
+                return set(self.token_permissions)
             return set(self.permissions)
+
+        def list_project_user_roles(project_id):
+            self.member_calls += 1
+            return [{"user_id": i, "role_id": 1} for i in self.members]
 
         for name, func in dict(
                 get_user=get_user, list_users=list_users, resolve_permissions=resolve_permissions,
-                list_project_user_roles=lambda project_id: [{"user_id": i, "role_id": 1} for i in self.members],
+                list_project_user_roles=list_project_user_roles,
                 has_access=lambda current, required: bool(set(required) & set(current))).items():
             self.monkeypatch.setattr(StubAuth, name, staticmethod(func), raising=False)
 
-    def call(self, name, verb, *path, body=None, raw=None, query=None, actor=None):
+    def _project_by_id(self, project_id):
+        if self.project_rpc_down:
+            raise TimeoutError("rpc down")
+        return {"id": project_id} if project_id in self.projects else None
+
+    def call(self, name, verb, *path, body=None, raw=None, query=None, actor=None, auth_type="user", **request_kwargs):
         self.set_actor(CREATOR if actor is None else actor)
-        kwargs = {"method": "GET" if verb == "get" else "POST", "query_string": query or {}}
+        kwargs = {"method": "GET" if verb == "get" else "POST", "query_string": query or {}, **request_kwargs}
         if raw is not None:
-            kwargs.update(data=raw, content_type="application/json")
+            kwargs.update(data=raw)
+            kwargs.setdefault("content_type", "application/json")
         elif body is not None:
             kwargs["json"] = body
+        module = types.SimpleNamespace(context=types.SimpleNamespace(rpc_manager=types.SimpleNamespace(
+            call=types.SimpleNamespace(project_get_by_id=lambda project_id: self._project_by_id(project_id)))))
         with app.test_request_context(**kwargs):
-            handler = self.mods[name].AdminAPI(api=types.SimpleNamespace(module=None), mode="administration")
+            g.auth = types.SimpleNamespace(type=auth_type, id=CREATOR)
+            handler = self.mods[name].AdminAPI(api=types.SimpleNamespace(module=module), mode="administration")
             return getattr(handler, verb)(*path)
 
     # -- references
@@ -609,11 +631,13 @@ def test_every_endpoint_declares_its_permissions_and_the_operator_roles(rest, mo
     declared = descriptor(rest, module, verb)
     assert declared["permissions"] == permissions
     admin = declared["recommended_roles"]["administration"]
-    assert admin == {"super_admin": True, "admin": True, "viewer": False, "editor": False}
-    default = declared["recommended_roles"]["default"]
-    assert not default.get("super_admin", False) and not default.get("viewer", False) and not default.get("editor", False)
+    assert admin == {"system": False, "super_admin": True, "admin": True, "viewer": False, "editor": False}
+    effective = effective_roles(declared["recommended_roles"])
+    assert effective["administration"] == {"system": False, "super_admin": True, "admin": True, "viewer": False,
+                                           "editor": False}
+    assert not effective["default"]["system"] and not effective["default"]["viewer"] and not effective["default"]["editor"]
     if permissions == ["credentials.view"]:
-        assert not any(default.values())  # the project mode does not see these endpoints at all
+        assert not any(effective["default"].values())  # the project mode does not see these endpoints at all
     handler = rest.mods[module]
     assert list(handler.API.mode_handlers) == ["administration"] and handler.API.mode_handlers["administration"] is handler.AdminAPI
 
@@ -749,8 +773,9 @@ def test_the_status_of_a_code(rest):
     assert [status_of(code) for code in (
         "INVALID_REQUEST", "APPROVAL_REQUIRED", "FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "REFERENCE_NOT_FOUND",
         "GRANT_NOT_FOUND", "INVALID_STATE", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS", "REQUEST_TOO_LARGE",
-        "DEPENDENCY_UNAVAILABLE", "STORE_DENIED", "STORE_UNAVAILABLE", "FAILED", "SOMETHING_NEW", None)] == [
-        400, 400, 403, 403, 403, 404, 404, 409, 409, 409, 409, 413, 503, 503, 503, 500, 500, 500]
+        "DEPENDENCY_UNAVAILABLE", "STORE_DENIED", "STORE_UNAVAILABLE", "FAILED", "SOMETHING_NEW", None,
+        "STORE_VERSION_CONFLICT", "STORE_SEALED", "AUDIT_UNAVAILABLE", "NOT_FOUND")] == [
+        400, 400, 403, 403, 403, 404, 404, 409, 409, 409, 409, 413, 503, 403, 503, 500, 500, 500, 409, 503, 503, 404]
 
 
 def test_a_row_filed_under_another_project_is_not_found_even_in_the_same_schema(rest):
@@ -800,17 +825,254 @@ def test_a_full_lifecycle_over_rest_never_shows_the_secret(rest):
 
 
 def test_the_permissions_are_registered_for_the_operator_api(gov, monkeypatch):
+    """What the auth plugin ends up granting: super_admin and admin, never editor, viewer or the system role."""
     registered = []
     monkeypatch.setattr(StubAuth, "register_permissions", staticmethod(registered.append), raising=False)
     from unittest.mock import MagicMock  # pylint: disable=C0415
     descriptor_ = MagicMock()
     descriptor_.metadata = {}
     gov.module("module").Module(context=MagicMock(), descriptor=descriptor_).init()
-    roles = {entry["permissions"][0]: entry["recommended_roles"] for entry in registered
+    roles = {entry["permissions"][0]: effective_roles(entry["recommended_roles"]) for entry in registered
              if entry["permissions"][0].startswith("credentials.")}
-    assert roles["credentials.view"]["administration"] == {"super_admin": True, "admin": True, "viewer": False, "editor": False}
+    operators = {"system": False, "super_admin": True, "admin": True, "viewer": False, "editor": False}
+    for name in ("credentials.view", "credentials.manage", "credentials.probe", "credentials.approve"):
+        assert roles[name]["administration"] == operators, name
+        assert roles[name]["default"]["system"] is False and roles[name]["default"]["editor"] is False, name
     assert not any(roles["credentials.view"]["default"].values())
-    for name in ("credentials.manage", "credentials.probe", "credentials.approve"):
-        assert roles[name]["administration"]["super_admin"] is True and roles[name]["administration"]["admin"] is True
-    assert not any(any(roles["credentials.reveal"][mode].values()) for mode in ("default", "administration"))
-    assert "super_admin" not in roles["credentials.use"]["administration"]  # unchanged
+    assert roles["credentials.manage"]["default"]["admin"] is True  # as before
+    for modes in roles["credentials.reveal"].values():  # untouched, and read by no route
+        assert not (modes["admin"] or modes["editor"] or modes["viewer"])
+    assert roles["credentials.use"]["administration"]["system"] is True  # credentials.use is exactly as it was
+    assert roles["credentials.use"]["default"] == {**roles["credentials.use"]["default"], "admin": True, "viewer": True,
+                                                   "editor": True}
+
+
+# --- review fixes -----------------------------------------------------------------------------------------------
+
+DOCUMENTED_FACT_KEYS = {"id", "project_id", "type", "section", "generation", "title"}
+
+
+def test_the_fake_configuration_facts_have_the_documented_shape(rest):
+    """Contract: ``configuration_credential_facts`` answers exactly these keys (``title`` is the configuration's
+    ``elitea_title``, null when it has none). A fake that drifts from it would hide a field that is null in production."""
+    for title in (None, "GitHub prod"):
+        config = rest.gov.configurations.add(P1, title=title)
+        fact = rest.gov.configurations.configuration_credential_facts(P1, [config.uuid])[config.uuid]
+        assert set(fact) == DOCUMENTED_FACT_KEYS and fact["title"] == title
+
+
+def test_a_fact_without_a_title_gives_a_null_title_and_the_search_still_works(rest):
+    config = rest.gov.configurations.add(P1)
+    rest.new_ref(P1, configuration=config)
+    service = rest.gov.this.modules["configurations"].module
+    real = service.configuration_credential_facts
+    service.configuration_credential_facts = lambda project_id, uuids: {
+        key: {k: v for k, v in fact.items() if k != "title"} for key, fact in real(project_id, uuids).items()}
+    row = rest.list_refs(P1)[0]["rows"][0]
+    assert row["configuration"]["title"] is None and rest.list_refs(P1, search="x")[0]["rows"] == []
+
+
+def test_a_reference_search_matches_the_configuration_title_as_well_as_the_provider(rest):
+    pretty = rest.new_ref(P1, configuration=rest.gov.configurations.add(P1, type_="jira", title="Payments Jira"))
+    plain = rest.new_ref(P1, configuration=rest.gov.configurations.add(P1, type_="github"))
+    ids = lambda search: {row["id"] for row in rest.list_refs(P1, search=search)[0]["rows"]}  # noqa: E731
+    assert ids("payments") == {pretty} and ids("PAYM") == {pretty} and ids("github") == {plain} and ids("jira") == {pretty}
+    assert ids("%") == set() and ids("nothing like it") == set()
+    assert rest.list_refs(P1, search="payments")[0]["total"] == 1
+
+
+def test_valid_until_is_the_validated_value_not_a_second_parse(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    body, _ = rest.create_grant(binding, ref, valid_until=soon)
+    stored = rest.gov.grant(P1, uuid.UUID(body["id"])).valid_until
+    assert stored is not None and abs((stored.replace(tzinfo=timezone.utc) - datetime.fromisoformat(soon)).total_seconds()) < 1
+    # a time that has passed by the time the body is looked at is refused, never turned into "no end"
+    api = rest.mods["credential_grants"].api
+    assert api.GrantCreate.parse_obj({
+        "agent_binding_ref": binding, "toolkit_id": 1, "credential_ref": ref, "subject_user_id": 1,
+        "valid_until": soon}).valid_until == datetime.fromisoformat(soon).astimezone(timezone.utc)
+
+
+@pytest.mark.parametrize("value", [
+    lambda: (datetime.now(timezone.utc) + timedelta(days=366)).isoformat(),
+    lambda: "9999-12-31T23:59:59-23:59", lambda: "9999-12-31T23:59:59+00:00", lambda: "0001-01-01T00:00:00+23:59",
+    lambda: "2999-01-01T00:00:00+00:00"])
+def test_valid_until_is_bounded_ahead_and_representable(rest, value):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    assert rest.create_grant(binding, ref, valid_until=value()) == BAD_REQUEST
+    assert rest.list_grants()[0]["total"] == 0
+
+
+def test_valid_until_a_year_ahead_is_accepted(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    ahead = (datetime.now(timezone.utc) + timedelta(days=364)).isoformat()
+    assert rest.create_grant(binding, ref, valid_until=ahead)[1] == 201
+    assert rest.mods["credential_grants"].api.MAX_GRANT_VALIDITY_DAYS == 365
+
+
+def test_only_a_json_body_is_read(rest):
+    body = json.dumps({"configuration_uuid": rest.gov.configurations.add(P1).uuid, "store_kind": "database",
+                       "ownership_class": "service"}).encode()
+    for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
+        reply = rest.call("credential_references", "post", P1, raw=body, content_type=content_type)
+        assert reply == ({"error": "The request is not valid.", "code": "INVALID_REQUEST"}, 415), content_type
+    assert rest.call("credential_references", "post", P1, raw=body, content_type="application/vnd.api+json")[1] == 201
+    assert rest.list_refs()[0]["total"] == 1
+
+
+def test_a_body_of_exactly_the_cap_is_read_and_one_byte_more_is_refused(rest):
+    config = rest.gov.configurations.add(P1)
+    exact = json.dumps({"configuration_uuid": config.uuid, "store_kind": "database", "ownership_class": "service"}).encode()
+    exact += b" " * (8192 - len(exact))
+    assert len(exact) == 8192 and rest.call("credential_references", "post", P1, raw=exact)[1] == 201
+    over = exact + b" "
+    assert len(over) == 8193
+    assert rest.call("credential_references", "post", P1, raw=over) == (
+        {"error": "The request is too large.", "code": "REQUEST_TOO_LARGE"}, 413)
+
+
+def test_a_chunked_body_without_a_length_is_read_up_to_the_cap(rest):
+    """No Content-Length (chunked transfer behind a server that terminates the input): read, not refused outright."""
+    config = rest.gov.configurations.add(P1)
+    exact = json.dumps({"configuration_uuid": config.uuid, "store_kind": "database", "ownership_class": "service"}).encode()
+    exact += b" " * (8192 - len(exact))
+    chunked = dict(content_type="application/json", environ_overrides={"wsgi.input_terminated": True})
+    ok = rest.call("credential_references", "post", P1, input_stream=io.BytesIO(exact), **chunked)
+    assert ok[1] == 201
+    too_big = rest.call("credential_references", "post", P1, input_stream=io.BytesIO(exact + b" " * 5000), **chunked)
+    assert too_big == ({"error": "The request is too large.", "code": "REQUEST_TOO_LARGE"}, 413)
+
+
+@pytest.mark.parametrize("query", [
+    {"offset": "10000001"}, {"limit": str(2**31)}, {"owner_user_id": str(2**31)}, {"owner_user_id": "99999999999999999999"}])
+def test_numbers_that_a_column_cannot_hold_are_a_400_not_a_database_error(rest, query):
+    assert rest.list_refs(**query) == BAD_REQUEST
+    assert rest.list_grants(**{k: v for k, v in query.items() if k != "owner_user_id"} or {"toolkit_id": str(2**31)}) == BAD_REQUEST
+
+
+def test_the_largest_accepted_numbers(rest):
+    assert rest.list_refs(offset=10_000_000, limit=2**31 - 1)[1] == 200
+    assert rest.list_grants(toolkit_id=2**31 - 1, subject_user_id=2**31 - 1)[1] == 200
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    assert rest.create_grant(binding, ref, toolkit_id=2**31)[1] == 400
+    assert rest.create_grant(binding, ref, subject_user_id=2**31)[1] == 400
+    assert rest.mods["credential_references"].api.MAX_OFFSET == 10_000_000
+
+
+@pytest.mark.parametrize("value", ["a b", "a;b", "a\nb", "ünï", "x" * 129, ""])
+def test_approval_references_use_the_task_alphabet(rest, value):
+    ref = rest.new_ref(P1, until="validated")
+    other = rest.call("credential_reference_action", "post", P1, uuid.UUID(ref),
+                      body={"action": "approve", "approval_ref": value, "policy_revision": "rev-1"}, actor=APPROVER)
+    assert other == BAD_REQUEST
+
+
+def test_an_unknown_project_is_a_404_and_a_failing_lookup_a_503(rest):
+    assert rest.list_refs(77) == ({"error": "The project does not exist.", "code": "NOT_FOUND"}, 404)
+    assert rest.list_grants(77)[1] == 404 and rest.create_ref(77)[1] == 404
+    assert rest.list_refs(2**40)[1] == 404  # not looked up at all
+    rest.project_rpc_down = True
+    assert rest.list_refs(P1) == ({"error": "A required service is unavailable; nothing was changed.",
+                                   "code": "DEPENDENCY_UNAVAILABLE"}, 503)
+
+
+def test_a_down_audit_trail_is_a_503_and_nothing_is_kept(rest):
+    ref = rest.new_ref(P1, until="active")
+    binding = rest.seed_binding()
+    grant = rest.create_grant(binding, ref)[0]["id"]
+    events = len(rest.events())
+    rest.gov.tracing.fail = True
+    expected = ({"error": "The audit trail is unavailable.", "code": "AUDIT_UNAVAILABLE"}, 503)
+    assert rest.ref_action(ref, "suspend") == expected
+    assert rest.grant_action(grant, "revoke") == expected
+    assert rest.create_ref() == expected
+    assert rest.create_grant(binding, ref, subject_user_id=APPROVER) == expected
+    rest.gov.tracing.fail = False
+    assert rest.gov.reference(P1, uuid.UUID(ref)).state == "active"
+    assert rest.gov.grant(P1, uuid.UUID(grant)).state == "pending_approval"
+    assert rest.list_refs()[0]["total"] == 1 and rest.list_grants()[0]["total"] == 1
+    assert len(rest.events()) == events
+
+
+def test_the_task_still_reports_a_down_audit_trail_as_failed(rest):
+    """The REST code is a mapping of the same failure: the task's text and code are unchanged."""
+    ref = str(rest.gov.add_reference(P1, state="active"))
+    rest.gov.tracing.fail = True
+    result = rest.onboarding.manage_reference(f"project_id={P1};action=suspend;ref={ref}", CREATOR)
+    assert result == {"error": "failed; if an import was running, run reconcile_credential_store", "code": "FAILED"}
+    assert rest.gov.reference(P1, uuid.UUID(ref)).state == "active"
+
+
+def test_a_lost_race_is_a_409_through_rest_and_writes_no_event(rest, monkeypatch):
+    ref = rest.new_ref(P1, until="active")
+    binding = rest.seed_binding()
+    grant = rest.create_grant(binding, ref)[0]["id"]
+    events = len(rest.events())
+    monkeypatch.setattr(rest.onboarding, "transition_reference", lambda *a, **k: False)
+    monkeypatch.setattr(rest.grants, "transition_grant", lambda *a, **k: False)
+    monkeypatch.setattr(rest.grants, "approve_grant", lambda *a, **k: False)
+    expected = ({"error": "The record changed while this ran; read it again and retry.", "code": "CONCURRENT_CHANGE"}, 409)
+    assert rest.ref_action(ref, "suspend") == expected
+    assert rest.grant_action(grant, "revoke") == expected
+    assert rest.grant_action(grant, "approve", actor=APPROVER, approval_ref="A", policy_revision="B") == expected
+    assert rest.gov.reference(P1, uuid.UUID(ref)).state == "active" and len(rest.events()) == events
+
+
+def test_a_token_caller_is_held_to_the_permissions_of_the_token(rest):
+    """The in-handler check resolves permissions for the caller's own auth context (``flask.g.auth``), so a token
+    that lacks a permission is refused even though the user behind it has it. What this cannot prove: that the real
+    ``check_api`` refuses a token at the descriptor level (the stub never runs it) - only that nothing here lets a
+    token past the per-action check."""
+    ref = rest.new_ref(P1, until="validated")
+    binding = rest.seed_binding()
+    before = len(rest.events())
+    rest.token_permissions = {"credentials.view"}  # the user has everything; the token only reads
+    forbidden = ({"error": "You do not have permission to do this.", "code": "FORBIDDEN"}, 403)
+    assert rest.call("credential_reference_action", "post", P1, uuid.UUID(ref),
+                     body={"action": "approve", "approval_ref": "A", "policy_revision": "B"},
+                     actor=APPROVER, auth_type="token") == forbidden
+    assert rest.call("credential_reference_action", "post", P1, uuid.UUID(ref), body={"action": "retire"},
+                     auth_type="token") == forbidden
+    assert len(rest.events()) == before and rest.gov.reference(P1, uuid.UUID(ref)).state == "validated"
+    rest.token_permissions = {"credentials.approve"}
+    assert rest.call("credential_reference_action", "post", P1, uuid.UUID(ref),
+                     body={"action": "approve", "approval_ref": "A", "policy_revision": "B"},
+                     actor=APPROVER, auth_type="token")[1] == 200
+
+
+def test_grant_rows_are_listed_only_if_an_action_can_find_them(rest):
+    ref, binding = str(rest.gov.add_reference(P1, state="active")), rest.seed_binding()
+    rest.gov.add_grant(P1, credential_ref=uuid.UUID(ref), agent_binding_ref=uuid.UUID(binding), target_ref="repo:x")
+    listed = rest.create_grant(binding, ref)[0]["id"]
+    assert {row["id"] for row in rest.list_grants()[0]["rows"]} == {listed}
+    assert rest.grant_action(listed, "revoke")[1] == 200
+
+
+def test_the_subjects_of_a_page_are_named_without_asking_for_a_whole_project(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    rest.create_grant(binding, ref, subject_user_id=MEMBER)
+    rest.user_calls.clear()
+    rest.member_calls = 0
+    # for one user nothing but that user and the operators of the page is asked for
+    assert rest.list_grants(subject_user_id=MEMBER)[0]["rows"][0]["subject"]["user"]["id"] == MEMBER
+    assert rest.member_calls == 0 and {i for call in rest.user_calls for i in call} <= {MEMBER, CREATOR}
+    # an empty page asks for nobody
+    rest.user_calls.clear()
+    assert rest.list_grants(state="revoked")[0]["rows"] == [] and rest.user_calls == []
+
+
+def test_users_are_asked_for_in_chunks_of_at_most_a_hundred(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    rest.create_grant(binding, ref, subject_user_id=MEMBER)
+    for extra in range(1000, 1230):
+        rest.users[extra] = user(extra, f"u{extra}@x.test", oid=f"o{extra}")
+    rest.members = list(rest.users)
+    rest.user_calls.clear()
+    row = rest.list_grants()[0]["rows"][0]
+    assert row["subject"]["user"]["id"] == MEMBER
+    assert len(rest.user_calls) >= 3 and max(len(call) for call in rest.user_calls) <= 100
+    rest.members = list(range(5000, 7000))  # a project beyond the lookup bound: subjects stay unnamed, nobody is fetched
+    rest.user_calls.clear()
+    assert rest.list_grants()[0]["rows"][0]["subject"]["user"] is None
+    assert {i for call in rest.user_calls for i in call} <= {CREATOR}

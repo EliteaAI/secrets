@@ -11,7 +11,8 @@ _PROJECT = {"name": "project_id", "in": "path", "schema": {"type": "integer"}, "
 class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="List Credential References (Admin)",
-        description="List the credential references of a project with their state, owner and approval.",
+        description="List the credential references of a project with their state, owner and approval. "
+                    "Search matches the provider or the configuration title.",
         parameters=[_PROJECT, *api.list_parameters(
             queries.REFERENCE_SORTS,
             ("state", "string", REFERENCE_STATES), ("ownership_class", "string", OWNERSHIP_CLASSES),
@@ -21,19 +22,20 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     )
     @auth.decorators.check_api({"permissions": [api.VIEW], "recommended_roles": api.VIEW_ROLES})
     def get(self, project_id: int, **kwargs):  # pylint: disable=C0111
-        return api.respond(api.list_references, project_id)
+        return api.respond(self.module, api.list_references, project_id)
 
     @register_openapi(
         name="Create Credential Reference (Admin)",
         description="Register a credential of the project for governed use. The reference starts pending; its "
                     "secret is imported afterwards, on the server.",
         parameters=[_PROJECT],
+        request_body=api.ReferenceCreate,
         mcp_tool=False,
         available_to_users=False,
     )
     @auth.decorators.check_api({"permissions": [api.MANAGE], "recommended_roles": api.OPERATE_ROLES})
     def post(self, project_id: int, **kwargs):  # pylint: disable=C0111
-        return api.respond(api.create_reference, project_id)
+        return api.respond(self.module, api.create_reference, project_id)
 
 
 class API(api_tools.APIBase):  # pylint: disable=R0903,C0111

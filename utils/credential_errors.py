@@ -35,6 +35,8 @@ MESSAGES = {
     "SUBJECT_NOT_FOUND": "The user does not exist.",
     "SUBJECT_UNLINKED": "The user has no linked identity-provider subject.",
     "INVALID_TRANSITION": "This change is not allowed from the current state.",
+    "NOT_FOUND": "The project does not exist.",
+    "AUDIT_UNAVAILABLE": "The audit trail is unavailable.",
     "FAILED": "The request failed.",
 }
 

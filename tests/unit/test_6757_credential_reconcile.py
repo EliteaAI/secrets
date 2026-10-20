@@ -1,4 +1,13 @@
-"""C-1009 (#6757): the store reconciler and the store smoke test."""
+"""C-1009 (#6757): the store reconciler and the store smoke test.
+
+Clock skew (a flake seen once on a freshly started PostgreSQL container, 16 of these tests failing together): a ledger
+row's ``updated_at`` is written by the database (``now()``), while the reconciler's cutoff is the Python clock
+(``now - older_than_s``). With ``older_than_s=0`` a database clock that runs ahead of the host's, as a container VM
+can right after start, puts the row "in the future" and it is not yet eligible. The tests that ask for ``0`` therefore
+age the ledger by a minute first (``Governance.age_ledger`` writes ``updated_at`` from the Python clock), which makes
+them independent of the skew. The hypothesis was not reproduced; it fits the pattern (all and only the
+``older_than_s=0`` tests failed, and a rerun passed).
+"""
 import json
 import uuid
 
@@ -37,6 +46,13 @@ def rec(gov, monkeypatch):
     missing = []
     monkeypatch.setattr(reconciler, "project_ids_missing_credential_tables", lambda: list(missing))  # PostgreSQL's catalog
     reconciler.missing = missing
+    original = reconciler.reconcile_project
+
+    def aged(project_id, older_than_s, actor, dry_run=False):
+        if older_than_s == 0:  # see the module docstring: eligible whatever the database clock says
+            gov.age_ledger(project_id, 60)
+        return original(project_id, older_than_s, actor, dry_run)
+    monkeypatch.setattr(reconciler, "reconcile_project", aged)
     return reconciler
 
 

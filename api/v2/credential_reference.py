@@ -19,7 +19,7 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     )
     @auth.decorators.check_api({"permissions": [api.VIEW], "recommended_roles": api.VIEW_ROLES})
     def get(self, project_id: int, ref_id, **kwargs):  # pylint: disable=C0111
-        return api.respond(api.get_reference, project_id, ref_id)
+        return api.respond(self.module, api.get_reference, project_id, ref_id)
 
 
 class API(api_tools.APIBase):  # pylint: disable=R0903,C0111

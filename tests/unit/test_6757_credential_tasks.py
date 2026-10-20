@@ -9,6 +9,7 @@ import pytest
 import sqlalchemy as sa
 
 from fixtures.governance import FIXTURE_VALUE
+from fixtures.permissions import effective_roles
 from run_tests import StubAuth, StubLog
 
 TABLES = ["credential_reference", "credential_use_grant", "credential_store_ledger"]
@@ -262,9 +263,12 @@ def test_init_loads_the_methods_and_registers_the_credential_permissions(plugin)
                                    "credentials.reveal", "credentials.use", "credentials.view"]
     assert permissions["credentials.use"]["default"] == {"admin": True, "viewer": True, "editor": True}
     for name in ("credentials.manage", "credentials.probe", "credentials.approve"):
-        assert permissions[name]["default"] == {"admin": True, "viewer": False, "editor": False}
-        assert permissions[name]["administration"] == {
-            "super_admin": True, "admin": True, "viewer": False, "editor": False}
+        # what the role model grants after its defaults: operators only, never the system role
+        administration = effective_roles(permissions[name])["administration"]
+        assert (administration["super_admin"], administration["admin"]) == (True, True)
+        assert not (administration["editor"] or administration["viewer"] or administration["system"]), name
+        default = effective_roles(permissions[name])["default"]
+        assert (default["admin"], default["editor"], default["viewer"], default["system"]) == (True, False, False, False)
     assert not any(any(permissions["credentials.reveal"][mode].values()) for mode in ("default", "administration"))
     assert any(entry["permissions"] == ["configuration.secrets"] for entry in plugin.registered)  # untouched
 

@@ -16,6 +16,7 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
             {"name": "ref_id", "in": "path", "schema": {"type": "string", "format": "uuid"},
              "description": "Credential reference identifier."},
         ],
+        request_body=api.ReferenceAction,
         mcp_tool=False,
         available_to_users=False,
     )
@@ -23,7 +24,7 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @auth.decorators.check_api({"permissions": [api.MANAGE, api.PROBE, api.APPROVE],
                                 "recommended_roles": api.OPERATE_ROLES})
     def post(self, project_id: int, ref_id, **kwargs):  # pylint: disable=C0111
-        return api.respond(api.reference_action, project_id, ref_id)
+        return api.respond(self.module, api.reference_action, project_id, ref_id)
 
 
 class API(api_tools.APIBase):  # pylint: disable=R0903,C0111

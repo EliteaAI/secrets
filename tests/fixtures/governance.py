@@ -325,8 +325,10 @@ class FakeConfigurations:
         row.generation += 1
 
     def configuration_credential_facts(self, project_id, uuids):
+        """The shape of the real method: ``{uuid: {id, project_id, type, section, generation, title}}`` (``title`` is the
+        configuration's ``elitea_title``; test_7119 pins the key set)."""
         return {row.uuid: {"id": row.id, "project_id": row.project_id, "type": row.type, "section": row.section,
-                           "generation": row.generation, **({"title": row.title} if row.title else {})}
+                           "generation": row.generation, "title": row.title}
                 for row in self.rows.get(project_id, {}).values() if row.uuid in uuids}
 
     def configuration_secret_bundle(self, project_id, configuration_id, ctx):
