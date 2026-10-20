@@ -1,0 +1,7 @@
+# Issue #6757 (C-1009): credential governance tables - credential_reference, credential_use_grant and
+# credential_store_ledger in every project schema. Nothing reads them until the admission layer ships
+# (WP-1B PR C), so this is not urgent; new projects get them via create_all and the startup safety net
+# creates them for existing projects. Run the task to report (dry_run) or re-run. Idempotent: schemas that
+# have all three tables are left alone.
+Run admin task create_credential_governance_tables with param: project_id=all;dry_run
+Run admin task create_credential_governance_tables with param: project_id=all
