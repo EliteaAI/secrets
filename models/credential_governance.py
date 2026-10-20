@@ -29,6 +29,9 @@ SUBJECT_KINDS = ('user_delegation', 'mandate')
 GRANT_STATES = ('pending_approval', 'active', 'suspended', 'revoked')
 LEDGER_OPS = ('write', 'delete_all')
 LEDGER_STATES = ('intent', 'written', 'committed', 'abandoned')
+LEGACY_INDEX = 'uq_credential_reference_live_configuration'
+SHARED_INDEX = 'uq_credential_reference_live_shared'
+PERSONAL_INDEX = 'uq_credential_reference_live_personal'
 
 # Columns that never change after the row exists (approved_by is set once, see _ONCE)
 REFERENCE_IMMUTABLE = frozenset({
@@ -65,8 +68,13 @@ class CredentialReference(db_tools.AbstractBaseMixin, db.Base):
             "AND generation >= 1 AND validated_generation = generation)",
             name='credential_reference_active_ck'),
         CheckConstraint('approved_by IS NULL OR approved_by <> created_by', name='credential_reference_approver_ck'),
-        Index('uq_credential_reference_live_configuration', 'configuration_id', unique=True,
-              postgresql_where=text("state <> 'retired'")),
+        # One live reference per configuration for every class but personal, and one personal reference per owner of
+        # the configuration (#7119). Projects created before the personal class carry the single
+        # ``uq_credential_reference_live_configuration`` index until ``create_credential_governance_tables`` swaps it.
+        Index(SHARED_INDEX, 'configuration_id', unique=True,
+              postgresql_where=text("state <> 'retired' AND ownership_class <> 'personal'")),
+        Index(PERSONAL_INDEX, 'configuration_id', text("(custodian_ref->>'subject_ref')"), unique=True,
+              postgresql_where=text("state <> 'retired' AND ownership_class = 'personal'")),
         {'schema': c.POSTGRES_TENANT_SCHEMA},
     )
 

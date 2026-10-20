@@ -49,7 +49,8 @@ _BINDING = Table(
     Column("application_id", Integer), Column("version_id", Integer), schema=c.POSTGRES_TENANT_SCHEMA)
 _MANDATE = Table(
     "autonomous_mandate", _VIEWS, Column("id", Uuid, primary_key=True), Column("project_id", Integer),
-    Column("agent_binding_ref", Uuid), Column("state", String), schema=c.POSTGRES_TENANT_SCHEMA)
+    Column("agent_binding_ref", Uuid), Column("owner_user_id", Integer), Column("state", String),
+    schema=c.POSTGRES_TENANT_SCHEMA)
 _TOOL_MAPPING = Table(
     "entity_tool_mapping", _VIEWS, Column("tool_id", Integer, primary_key=True), Column("entity_version_id", Integer),
     Column("entity_type", String), schema=c.POSTGRES_TENANT_SCHEMA)
@@ -139,8 +140,8 @@ def _subject_fields(values):
 
 
 def _check_mandate(session, values, project_id):
-    """A mandate subject must be a live-enough mandate of this project for this very binding."""
-    mandate = session.execute(select(_MANDATE.c.agent_binding_ref, _MANDATE.c.state).where(
+    """A mandate subject must be a live-enough mandate of this project for this very binding. Returns its owner."""
+    mandate = session.execute(select(_MANDATE.c.agent_binding_ref, _MANDATE.c.state, _MANDATE.c.owner_user_id).where(
         _MANDATE.c.id == uuid.UUID(values["subject_ref"].partition(":")[2]),
         _MANDATE.c.project_id == project_id)).first()
     if mandate is None:
@@ -149,6 +150,18 @@ def _check_mandate(session, values, project_id):
         raise CredentialTaskError("MANDATE_BINDING_MISMATCH")
     if mandate.state in INACTIVE_MANDATE_STATES:
         raise CredentialTaskError("MANDATE_INACTIVE")
+    return mandate.owner_user_id
+
+
+def _check_owner(reference, values, mandate_owner):
+    """A personal credential is granted to its owner only: to the person, or to a mandate the person owns."""
+    custodian = reference.custodian_ref if isinstance(reference.custodian_ref, dict) else {}
+    if subject_kind(values["subject_ref"]) == "mandate":
+        owner_ok = mandate_owner is not None and mandate_owner == custodian.get("user_id")
+    else:
+        owner_ok = custodian.get("subject_ref") == values["subject_ref"]
+    if not owner_ok:
+        raise CredentialTaskError("SUBJECT_NOT_OWNER")
 
 
 def _event(reason_code, values, actor, event_type="lifecycle", **fields):
@@ -161,12 +174,14 @@ def _event(reason_code, values, actor, event_type="lifecycle", **fields):
 def _create(values, actor):
     project_id = values["project_id"]
     with project_tx(project_id) as session:
-        reference = session.execute(select(CredentialReference.state).where(
+        reference = session.execute(select(
+            CredentialReference.state, CredentialReference.ownership_class, CredentialReference.custodian_ref,
+        ).where(
             CredentialReference.id == uuid.UUID(values["ref"]), CredentialReference.project_id == project_id,
         )).first()
         if reference is None:
             raise CredentialTaskError("REFERENCE_NOT_FOUND")
-        if reference[0] == "retired":
+        if reference.state == "retired":
             raise CredentialTaskError("INVALID_STATE")
         binding = session.execute(select(_BINDING.c.project_id, _BINDING.c.application_id, _BINDING.c.version_id).where(
             _BINDING.c.id == uuid.UUID(values["binding_ref"]))).first()
@@ -176,8 +191,11 @@ def _create(values, actor):
                 _TOOL_MAPPING.c.entity_version_id == binding.version_id, _TOOL_MAPPING.c.entity_type == "agent",
                 _TOOL_MAPPING.c.tool_id == values["toolkit_id"])).first() is None:
             raise CredentialTaskError("TOOLKIT_NOT_IN_BINDING")
+        mandate_owner = None
         if subject_kind(values["subject_ref"]) == "mandate":
-            _check_mandate(session, values, project_id)
+            mandate_owner = _check_mandate(session, values, project_id)
+        if reference.ownership_class == "personal":
+            _check_owner(reference, values, mandate_owner)
         if _find_grant(session, values) is not None:
             raise CredentialTaskError("GRANT_EXISTS")
         if values["dry_run"]:

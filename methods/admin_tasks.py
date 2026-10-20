@@ -17,6 +17,12 @@ class Method:
         are missing. New projects get them from ``create_all`` and a startup guard covers the rest, so this is
         the operator's way to report (dry run) and re-run. Idempotent; schemas that have all three are left alone.
 
+        Second step, ``personal_index`` (#7119): in projects whose tables predate personal credential references,
+        swaps the single live-reference unique index for two partial ones (one live non-personal reference per
+        configuration; one personal reference per owner of a configuration). Until it has run in a project, creating
+        a personal reference there is refused (``MIGRATION_REQUIRED``). It is reported under ``personal_index``
+        (``migrated`` = would swap, on a dry run).
+
         Param format (required):
             "project_id=<all|N>[;dry_run]"
 
@@ -26,7 +32,8 @@ class Method:
             "project_id=3"            - project 3 only
         """
         from ..utils.credential_schema import (  # pylint: disable=C0415
-            apply_credential_tables, parse_project_param, project_ids_missing_credential_tables, target_project_ids,
+            apply_credential_tables, apply_personal_index, parse_project_param, project_ids_missing_credential_tables,
+            project_ids_missing_personal_index, target_project_ids,
         )
 
         project_id_filter, dry_run, error = parse_project_param(kwargs.get("param", "") or "")
@@ -40,11 +47,20 @@ class Method:
             log.exception("create_credential_governance_tables: failed to list projects")
             return {"migrated": 0, "error": "failed to list projects"}
         migrated, failed = apply_credential_tables([pid for pid in project_ids if pid in missing], dry_run=dry_run)
+        try:   # projects that just got their tables have the new indexes already
+            pending = project_ids_missing_personal_index([pid for pid in project_ids if pid not in missing])
+        except Exception:  # pylint: disable=W0703
+            log.exception("create_credential_governance_tables: failed to read the indexes")
+            return {"migrated": len(migrated), "failed": len(failed), "failed_projects": failed, "dry_run": dry_run,
+                    "error": "failed to read the indexes"}
+        index_migrated, index_failed = apply_personal_index(pending, dry_run=dry_run)
         log.info(
-            "%screate_credential_governance_tables: migrated=%s failed=%s",
-            "[DRY RUN] " if dry_run else "", len(migrated), len(failed),
+            "%screate_credential_governance_tables: migrated=%s failed=%s personal_index migrated=%s failed=%s",
+            "[DRY RUN] " if dry_run else "", len(migrated), len(failed), len(index_migrated), len(index_failed),
         )
-        return {"migrated": len(migrated), "failed": len(failed), "failed_projects": failed, "dry_run": dry_run}
+        return {"migrated": len(migrated), "failed": len(failed), "failed_projects": failed, "dry_run": dry_run,
+                "personal_index": {"migrated": len(index_migrated), "failed": len(index_failed),
+                                   "failed_projects": index_failed}}
 
     @web.method()
     def manage_credential_reference(self, *args, **kwargs):
@@ -63,7 +79,12 @@ class Method:
         Actions: create (pending), import (copy the material, one generation per import), probe (compare the
         stored material with the configuration), approve (needs approval_ref and policy_revision; another
         operator than the creator), activate, suspend, resume, retire (deletes the stored material).
-        Store kinds: database, corporate_vault. Ownership classes: project_shared, service, technical.
+        Store kinds: database, corporate_vault. Ownership classes: project_shared, service, technical, personal.
+
+        A personal reference needs owner_user_id (a member of the project; their identity-provider subject is
+        resolved on the server) and a project updated by create_credential_governance_tables (personal_index). It
+        has no import: its value is written through the write-only credential_material endpoint. Its probe checks
+        the store; add check_connection to also test the stored value against its provider.
 
         Examples:
             "project_id=3;action=create;configuration_uuid=<uuid>;store_kind=database;ownership_class=project_shared"

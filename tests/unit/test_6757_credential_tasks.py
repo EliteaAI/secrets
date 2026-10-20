@@ -159,7 +159,8 @@ def patch_schema(gov, schema, monkeypatch):
 def test_the_task_creates_the_missing_tables_everywhere(tasks, patch_schema):
     module = Module()
     result = tasks.create_credential_governance_tables(module, param="project_id=all")
-    assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False}
+    assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False,
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
     assert patch_schema.applied == [([1, 2, 5], False)] and module.listed == [{"create_success": True}]
 
 
@@ -291,7 +292,8 @@ def test_a_registered_task_runs_the_method_on_the_module(gov, plugin, monkeypatc
     plugin.module.ready()
     monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_credential_tables", lambda: [])
     result = gov.admin.tasks["create_credential_governance_tables"](param="project_id=7;dry_run")
-    assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True}
+    assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True,
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
 
 
 def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):

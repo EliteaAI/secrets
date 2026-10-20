@@ -7,14 +7,17 @@ keys. Two bounded queries in the project's schema. Metadata only: no secret, no 
 import uuid
 
 from pylon.core.tools import web
-from sqlalchemy import or_, select
+from sqlalchemy import and_, false, or_, select
 from tools import db  # pylint: disable=E0401
 
 from ..models.credential_governance import CredentialReference, CredentialUseGrant
 
 MAX_SELECTORS = 64
+MAX_SUBJECT_CHARS = 160
 # 2: grant facts carry ``subject_kind`` and reference facts ``custodian_user_id`` (read by elitea_core's startup check).
-CREDENTIAL_FACTS_VERSION = 2
+# 3: reference facts carry ``custodian_subject_ref``, and ``credential_use_facts`` takes the caller's identity to find
+#    the caller's own personal reference of a configuration (#7119).
+CREDENTIAL_FACTS_VERSION = 3
 KEY_FIELDS = ("agent_binding_ref", "toolkit_instance_id", "credential_ref", "target_ref", "subject_ref")
 
 
@@ -53,8 +56,58 @@ def _custodian_user_id(custodian_ref):
     return user_id if isinstance(user_id, int) and not isinstance(user_id, bool) else None
 
 
+def _custodian_subject(custodian_ref):
+    """The identity-provider subject in a reference's ``custodian_ref`` JSON, or ``None``."""
+    subject = custodian_ref.get("subject_ref") if isinstance(custodian_ref, dict) else None
+    return subject if isinstance(subject, str) else None
+
+
 def _iso(value):
     return value.isoformat() if value is not None else None
+
+
+def _present(row) -> dict:
+    return {
+        "ref_id": str(row.id), "state": row.state, "generation": row.generation,
+        "configuration_generation": row.configuration_generation, "store_kind": row.store_kind,
+        "ownership_class": row.ownership_class, "revocation_epoch": row.revocation_epoch,
+        "custodian_user_id": _custodian_user_id(row.custodian_ref),
+        "custodian_subject_ref": _custodian_subject(row.custodian_ref)}
+
+
+def _caller_subject(personal_subject_ref, personal_user_id):
+    if personal_subject_ref is not None and (
+            not isinstance(personal_subject_ref, str) or not 0 < len(personal_subject_ref) <= MAX_SUBJECT_CHARS):
+        raise ValueError("personal_subject_ref: a subject reference")
+    if personal_user_id is not None and (isinstance(personal_user_id, bool) or not isinstance(personal_user_id, int)):
+        raise ValueError("personal_user_id: an integer")
+
+
+def _references_of_configurations(session, project_id, wanted, personal_subject_ref, personal_user_id) -> dict:
+    """One live reference per configuration id: the caller's own personal reference when there is one, else the
+    non-personal one (at most one by the index). A configuration with only other people's personal references gets
+    one of them, so the decision can name the class; the caller never uses it."""
+    base = (CredentialReference.project_id == project_id, CredentialReference.state != "retired",
+            CredentialReference.configuration_id.in_(wanted))
+    owner = []
+    if personal_subject_ref is not None:
+        owner.append(CredentialReference.custodian_ref["subject_ref"].as_string() == personal_subject_ref)
+    if personal_user_id is not None:
+        owner.append(CredentialReference.custodian_ref["user_id"].as_integer() == personal_user_id)
+    mine = and_(CredentialReference.ownership_class == "personal", or_(*owner)) if owner else false()
+    chosen = {}
+    for row in session.execute(select(CredentialReference).where(
+            *base, or_(CredentialReference.ownership_class != "personal", mine))).scalars():
+        rank = 1 if row.ownership_class == "personal" else 0
+        if row.configuration_id not in chosen or rank > chosen[row.configuration_id][0]:
+            chosen[row.configuration_id] = (rank, row)
+    found = {configuration_id: _present(row) for configuration_id, (_, row) in chosen.items()}
+    if len(found) < len(set(wanted)):
+        for row in session.execute(select(CredentialReference).where(
+                *base[:2], CredentialReference.configuration_id.in_([i for i in wanted if i not in found]))
+                .order_by(CredentialReference.created_at, CredentialReference.id).limit(MAX_SELECTORS)).scalars():
+            found.setdefault(row.configuration_id, _present(row))
+    return found
 
 
 class Method:
@@ -66,7 +119,10 @@ class Method:
         return CREDENTIAL_FACTS_VERSION
 
     @web.method()
-    def credential_use_facts(self, project_id: int, config_ids: list, grant_keys: list, ref_ids: list = None) -> dict:
+    def credential_use_facts(  # pylint: disable=R0913
+        self, project_id: int, config_ids: list, grant_keys: list, ref_ids: list = None,
+        personal_subject_ref: str = None, personal_user_id: int = None,
+    ) -> dict:
         """Live credential references and grants, for admission and the re-check of a queued run.
 
         ``config_ids``: configuration ids; ``ref_ids`` (optional): credential reference ids; ``grant_keys``: grant
@@ -81,23 +137,28 @@ class Method:
                                                  valid_until, operations}}}
 
         References are keyed by configuration id whichever selector found them. Times are ISO-8601 strings.
+
+        A configuration can have a shared reference and personal ones (one per owner). ``ref_ids`` return exactly
+        those references. ``config_ids`` return the personal reference whose custodian is the caller
+        (``personal_subject_ref`` = ``idp:<tenant>:<object>``, or ``personal_user_id``), else the non-personal one,
+        else (so the class can be refused by name) another owner's personal reference. ``custodian_subject_ref`` is the
+        owner's subject of a personal reference.
         """
+        _caller_subject(personal_subject_ref, personal_user_id)
         configs = [int(item) for item in _bounded("config_ids", config_ids)]
         refs = [_uuid(item) for item in _bounded("ref_ids", ref_ids)]
         keys = {_key(item) for item in _bounded("grant_keys", grant_keys)}
         references, grants = {}, {}
         with db.get_session(project_id) as session:
-            if configs or refs:
-                selected = [CredentialReference.configuration_id.in_(configs)] if configs else []
-                selected += [CredentialReference.id.in_(refs)] if refs else []
+            if refs:
                 for row in session.execute(select(CredentialReference).where(
                         CredentialReference.project_id == project_id, CredentialReference.state != "retired",
-                        or_(*selected))).scalars():
-                    references[row.configuration_id] = {
-                        "ref_id": str(row.id), "state": row.state, "generation": row.generation,
-                        "configuration_generation": row.configuration_generation, "store_kind": row.store_kind,
-                        "ownership_class": row.ownership_class, "revocation_epoch": row.revocation_epoch,
-                        "custodian_user_id": _custodian_user_id(row.custodian_ref)}
+                        CredentialReference.id.in_(refs))).scalars():
+                    references[row.configuration_id] = _present(row)
+            wanted = [item for item in configs if item not in references]
+            if wanted:
+                references.update(_references_of_configurations(
+                    session, project_id, wanted, personal_subject_ref, personal_user_id))
             if keys:
                 for row in session.execute(select(CredentialUseGrant).where(
                         CredentialUseGrant.project_id == project_id, CredentialUseGrant.state != "revoked",

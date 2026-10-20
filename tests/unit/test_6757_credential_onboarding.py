@@ -99,11 +99,15 @@ def flow(gov, ob):
     ("project_id=3;action=create;configuration_uuid=%s;store_kind=managed_vault;ownership_class=service" % uuid.uuid4(),
      "invalid store_kind"),
     ("project_id=3;action=create;configuration_uuid=%s;store_kind=database;ownership_class=personal" % uuid.uuid4(),
-     "invalid ownership_class"),
+     "owner_user_id goes with ownership_class=personal"),
+    ("project_id=3;action=create;configuration_uuid=%s;store_kind=database;ownership_class=service;owner_user_id=4"
+     % uuid.uuid4(), "owner_user_id goes with ownership_class=personal"),
+    ("project_id=3;action=probe;ref=" + str(uuid.uuid4()) + ";owner_user_id=4", "owner_user_id applies to create only"),
+    ("project_id=3;action=import;ref=" + str(uuid.uuid4()) + ";check_connection", "check_connection applies to probe only"),
     ("project_id=3;action=create;configuration_uuid=%s;store_kind=database;ownership_class=scheduled" % uuid.uuid4(),
      "invalid ownership_class"),
     ("project_id=3;action=approve;ref=" + str(uuid.uuid4()), "approval_ref, policy_revision required"),
-    ("project_id=3;action=probe;ref=" + str(uuid.uuid4()) + ";check_connection", "unknown parameter"),
+    ("project_id=3;action=probe;ref=" + str(uuid.uuid4()) + ";check_connection=1", "unknown parameter"),
     ("project_id=3;action=import;ref=" + str(uuid.uuid4()) + ";token=abc", "unknown parameter"),
 ])
 def test_bad_parameters_are_refused_before_anything_runs(gov, ob, param, fragment):

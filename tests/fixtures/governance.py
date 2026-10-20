@@ -48,7 +48,7 @@ TOOL_MAPPING = sa.Table("entity_tool_mapping", TEST_TABLES, sa.Column("id", sa.I
                         sa.Column("entity_type", sa.String), schema=SCHEMA)
 MANDATE = sa.Table("autonomous_mandate", TEST_TABLES, sa.Column("id", sa.Uuid, primary_key=True),
                    sa.Column("project_id", sa.Integer), sa.Column("agent_binding_ref", sa.Uuid),
-                   sa.Column("state", sa.String), schema=SCHEMA)
+                   sa.Column("owner_user_id", sa.Integer), sa.Column("state", sa.String), schema=SCHEMA)
 APPLICATION = sa.Table("applications", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
                        sa.Column("name", sa.String), schema=SCHEMA)
 VERSION = sa.Table("application_versions", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
@@ -310,6 +310,8 @@ class FakeConfigurations:
         self.rows = {}  # project_id -> {id: row}
         self.bundle_calls = []
         self.bundle_error = None
+        self.secret_paths = {"api_cred": ["api_key"]}  # type -> secret field paths (``headers.*`` = a map of passwords)
+        self.secret_fields_error = None
 
     def add(self, project_id, *, type_="api_cred", section="credentials", secrets=None, generation=1, title=None):
         rows = self.rows.setdefault(project_id, {})
@@ -330,6 +332,12 @@ class FakeConfigurations:
         return {row.uuid: {"id": row.id, "project_id": row.project_id, "type": row.type, "section": row.section,
                            "generation": row.generation, "title": row.title}
                 for row in self.rows.get(project_id, {}).values() if row.uuid in uuids}
+
+    def configuration_secret_fields(self, types):
+        """The shape of the real method: ``{type: [path, ...]}``, an unregistered type left out."""
+        if self.secret_fields_error:
+            raise self.secret_fields_error
+        return {name: list(self.secret_paths[name]) for name in types if name in self.secret_paths}
 
     def configuration_secret_bundle(self, project_id, configuration_id, ctx):
         self.bundle_calls.append((project_id, configuration_id, getattr(ctx, "purpose", None)))
@@ -369,10 +377,19 @@ class FakeAdmin:
 class FakeCore:
     def __init__(self):
         self.revoked = []
+        self.checks = []  # (project_id, configuration_uuid, type, user_id) of governed_check_connection
+        self.check_answer = {"success": True}
+        self.check_error = None
 
     def revoke_credential_contexts(self, session, credential_ref):
         _ = session
         self.revoked.append(credential_ref)
+
+    def governed_check_connection(self, project_id, configuration_uuid, config_type, user_id):
+        self.checks.append((project_id, configuration_uuid, config_type, user_id))
+        if self.check_error:
+            raise self.check_error
+        return dict(self.check_answer)
 
 
 # --- databases --------------------------------------------------------------------------------------------------------

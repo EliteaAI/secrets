@@ -337,10 +337,14 @@ def test_the_tables_compile_for_postgresql_in_the_tenant_schema(models):
     for table in (models.CredentialReference, models.CredentialUseGrant, models.CredentialStoreLedger):
         ddl = str(CreateTable(table.__table__).compile(dialect=dialect))
         assert f"CREATE TABLE tenant.{table.__tablename__}" in ddl
-    index = next(i for i in models.CredentialReference.__table__.indexes
-                 if i.name == "uq_credential_reference_live_configuration")
-    ddl = str(CreateIndex(index).compile(dialect=dialect))
-    assert "UNIQUE INDEX" in ddl and "WHERE state <> 'retired'" in ddl
+    indexes = {i.name: i for i in models.CredentialReference.__table__.indexes}
+    assert "uq_credential_reference_live_configuration" not in indexes   # replaced by the pair below (#7119)
+    shared = str(CreateIndex(indexes["uq_credential_reference_live_shared"]).compile(dialect=dialect))
+    assert "UNIQUE INDEX" in shared and "(configuration_id)" in shared
+    assert "WHERE state <> 'retired' AND ownership_class <> 'personal'" in shared
+    personal = str(CreateIndex(indexes["uq_credential_reference_live_personal"]).compile(dialect=dialect))
+    assert "UNIQUE INDEX" in personal and "(configuration_id, (custodian_ref->>'subject_ref'))" in personal
+    assert "WHERE state <> 'retired' AND ownership_class = 'personal'" in personal
 
 
 # --- generation compare-and-set -----------------------------------------------------------------------------------

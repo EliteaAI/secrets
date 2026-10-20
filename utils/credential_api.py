@@ -6,17 +6,20 @@ same functions the admin tasks end in, so a REST call writes the same rows and t
 Request bodies are strict: unknown fields, wrong types and a raw ``subject_ref`` are refused (400) before anything
 runs, and no reply contains a value from the request, a store locator or secret material.
 
-Not in this slice (PR 6, personal references): ``owner_user_id`` on create and ``check_connection`` on probe. Both are
-refused as unknown fields for now.
+Personal references (#7119, PR 6): ``owner_user_id`` on create (the owner is resolved on the server), ``check_connection``
+on probe, and the write-only value endpoint (``put_material``). The value is parsed once into ``SecretStr``; no reply, log
+line or error carries it.
 """
 import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Dict, Optional
 
 from flask import request
-from pydantic.v1 import BaseModel, Extra, StrictInt, StrictStr, ValidationError, root_validator, validator
+from pydantic.v1 import (
+    BaseModel, Extra, SecretStr, StrictBool, StrictInt, StrictStr, ValidationError, root_validator, validator,
+)
 from pylon.core.tools import log
 from tools import auth, config as c
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -24,6 +27,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from . import credential_queries as queries
 from .credential_errors import MESSAGES, CredentialTaskError
 from .credential_grants import grant_key_by_id, parse_valid_until, run_grant_action
+from .credential_material import MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_FIELDS, write_material
 from .credential_onboarding import (
     ACTIONS as REFERENCE_ACTIONS, ONBOARD_OWNERSHIP_CLASSES, ONBOARD_STORE_KINDS, run_reference_action,
 )
@@ -49,6 +53,7 @@ REFERENCE_ACTION_PERMISSION = {
 GRANT_ACTION_PERMISSION = {"approve": APPROVE, "suspend": MANAGE, "resume": MANAGE, "revoke": MANAGE}
 
 MAX_BODY_BYTES = 8192
+MAX_MATERIAL_BODY_BYTES = 16384  # the whole value body: at most MAX_FIELDS fields of MAX_FIELD_VALUE_CHARS each
 DEFAULT_LIMIT, MAX_LIMIT, MAX_SEARCH = 20, 100, 128
 MAX_OFFSET = 10_000_000
 MAX_INT32 = 2**31 - 1  # ids and limits are compared with 32-bit columns; a larger value would overflow in the database
@@ -58,15 +63,16 @@ SORT_ORDERS = ("asc", "desc")
 
 STATUS = {
     400: ("INVALID_REQUEST", "APPROVAL_REQUIRED", "CONFIGURATION_NOT_ELIGIBLE", "UNSUPPORTED_STORE_KIND",
-          "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH"),
+          "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER"),
     403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED"),
     404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
           "IMPORT_IN_FLIGHT", "CONFIGURATION_CHANGED", "MATERIAL_MISMATCH", "NO_SECRET_FIELDS", "SECRET_UNRESOLVED",
-          "MANDATE_INACTIVE", "SUBJECT_UNLINKED", "STORE_VERSION_CONFLICT"),
+          "MANDATE_INACTIVE", "SUBJECT_UNLINKED", "STORE_VERSION_CONFLICT", "MIGRATION_REQUIRED", "OWNER_UNLINKED",
+          "PERSONAL_ONLY", "USE_PERSONAL_VALUE", "SUBJECT_NOT_OWNER", "CHECK_CONNECTION_FAILED"),
     413: ("REQUEST_TOO_LARGE",),
-    503: ("DEPENDENCY_UNAVAILABLE", "AUDIT_UNAVAILABLE"),
+    503: ("DEPENDENCY_UNAVAILABLE", "AUDIT_UNAVAILABLE", "CHECK_CONNECTION_REFUSED"),
 }
 _STATUS_OF = {code: status for status, codes in STATUS.items() for code in codes}
 
@@ -158,20 +164,20 @@ def require_permission(permission, project_id):
 
 # --- request bodies ----------------------------------------------------------------------------------------------
 
-def read_json_object():
+def read_json_object(max_bytes=MAX_BODY_BYTES):
     """The JSON object of the request. Only a JSON content type is read (a form or text/plain post is refused with
     415), and the size is bound before parsing: the declared length is checked first, and the server is told to stop
     reading at the bound (a body without a length is read up to it)."""
     if not request.is_json:
         raise UnsupportedMediaType()
-    if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+    if request.content_length is not None and request.content_length > max_bytes:
         raise CredentialTaskError("REQUEST_TOO_LARGE")
-    request.max_content_length = MAX_BODY_BYTES
+    request.max_content_length = max_bytes
     try:
         raw = request.get_data(cache=False)
     except RequestEntityTooLarge:
         raise CredentialTaskError("REQUEST_TOO_LARGE") from None
-    if len(raw) > MAX_BODY_BYTES:
+    if len(raw) > max_bytes:
         raise CredentialTaskError("REQUEST_TOO_LARGE")
     try:
         data = json.loads(raw)
@@ -255,8 +261,19 @@ class ReferenceCreate(_Body):
     configuration_uuid: StrictStr
     store_kind: StrictStr
     ownership_class: StrictStr
+    owner_user_id: Optional[StrictInt] = None   # the owner of a personal reference: required for it, refused otherwise
 
     _uuid = validator("configuration_uuid", allow_reuse=True)(_uuid_text)
+
+    @validator("owner_user_id")
+    def _owner(cls, value):  # pylint: disable=E0213
+        return None if value is None else _bounded_id(value)
+
+    @root_validator
+    def _owner_goes_with_personal(cls, values):  # pylint: disable=E0213
+        if "ownership_class" in values and (values["ownership_class"] == "personal") != (values.get("owner_user_id") is not None):
+            raise ValueError("an owner goes with a personal reference, and only with it")
+        return values
 
     @validator("store_kind")
     def _store_kind(cls, value):  # pylint: disable=E0213
@@ -273,6 +290,42 @@ class ReferenceCreate(_Body):
 
 class ReferenceAction(_Approval):
     allowed_actions: ClassVar[tuple] = tuple(name for name in REFERENCE_ACTIONS if name != "create")
+    check_connection: Optional[StrictBool] = None   # probe of a personal reference: also test it against its provider
+
+    @root_validator
+    def _check_only_for_probe(cls, values):  # pylint: disable=E0213
+        if values.get("check_connection") is not None and values.get("action") != "probe":
+            raise ValueError("only probe checks the connection")
+        return values
+
+
+def _secret_text(value):
+    if not isinstance(value, str) or not 0 < len(value) <= MAX_FIELD_VALUE_CHARS:
+        raise ValueError("bad value")   # the message never holds the value
+    return value
+
+
+class MaterialBody(_Body):
+    """The value of a personal reference: field name -> text, and the generation the caller last saw. Values are
+    ``SecretStr`` from the moment they are parsed: a repr or a validation error never shows them."""
+    fields: Dict[StrictStr, SecretStr]
+    expected_generation: StrictInt
+
+    @validator("fields", pre=True)
+    def _bounded_fields(cls, value):  # pylint: disable=E0213
+        if not isinstance(value, dict) or not 0 < len(value) <= MAX_FIELDS:
+            raise ValueError("bad fields")
+        for name, text in value.items():
+            if not isinstance(name, str) or not 0 < len(name) <= MAX_FIELD_NAME_CHARS:
+                raise ValueError("bad field name")
+            _secret_text(text)
+        return value
+
+    @validator("expected_generation")
+    def _generation(cls, value):  # pylint: disable=E0213
+        if not 0 <= value <= MAX_INT32:
+            raise ValueError("bad generation")
+        return value
 
 
 class GrantCreate(_Body):
@@ -408,6 +461,8 @@ def create_reference(project_id):
     body = parse_body(ReferenceCreate, read_json_object())
     values = {"project_id": project_id, "action": "create", "configuration_uuid": body.configuration_uuid,
               "store_kind": body.store_kind, "ownership_class": body.ownership_class, "dry_run": False}
+    if body.owner_user_id is not None:
+        values["owner_user_id"] = body.owner_user_id
     return result_reply(run_reference_action(values, actor_id(), audit_code=True), created=True)
 
 
@@ -417,7 +472,16 @@ def reference_action(project_id, ref_id):
     values = {"project_id": project_id, "action": body.action, "ref": str(ref_id), "dry_run": False}
     if body.action == "approve":
         values.update(approval_ref=body.approval_ref, policy_revision=body.policy_revision)
+    if body.check_connection:
+        values["check_connection"] = True
     return result_reply(run_reference_action(values, actor_id(), audit_code=True))
+
+
+def put_material(project_id, ref_id):
+    """Write the value of a personal reference. Write-only: the reply holds the new generation and state, never the value."""
+    body = parse_body(MaterialBody, read_json_object(MAX_MATERIAL_BODY_BYTES))
+    result = write_material(project_id, str(ref_id), body.fields, body.expected_generation, actor_id())
+    return result_reply(result)
 
 
 def list_grants(project_id):
