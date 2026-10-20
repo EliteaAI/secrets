@@ -445,13 +445,10 @@ _ACTIONS = {
 }
 
 
-def manage_reference(param, actor_user_id=0):
-    """Run one reference action. Returns a result dict, or ``{"error": ..., "code": ...}`` with nothing
-    written (an import or probe that failed after it began has recorded the failure)."""
-    values, error = parse_reference_param(param)
-    if error:
-        log.error("manage_credential_reference: %s", error)
-        return {"error": error}
+def run_reference_action(values, actor_user_id=0):
+    """Run one reference action from parsed ``values`` (the admin task and the REST API both end here). Returns
+    a result dict, or ``{"error": ..., "code": ...}`` with nothing written (an import or probe that failed after
+    it began has recorded the failure)."""
     try:
         if not values["dry_run"]:
             require_actor(actor_user_id)
@@ -465,3 +462,12 @@ def manage_reference(param, actor_user_id=0):
     except Exception as exc:  # pylint: disable=W0703
         log.error("manage_credential_reference: failed (%s)", type(exc).__name__)
         return {"error": "failed; if an import was running, run reconcile_credential_store", "code": "FAILED"}
+
+
+def manage_reference(param, actor_user_id=0):
+    """The admin task: parse the parameter string, then run the action."""
+    values, error = parse_reference_param(param)
+    if error:
+        log.error("manage_credential_reference: %s", error)
+        return {"error": error}
+    return run_reference_action(values, actor_user_id)

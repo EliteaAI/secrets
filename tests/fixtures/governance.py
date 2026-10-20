@@ -49,6 +49,12 @@ TOOL_MAPPING = sa.Table("entity_tool_mapping", TEST_TABLES, sa.Column("id", sa.I
 MANDATE = sa.Table("autonomous_mandate", TEST_TABLES, sa.Column("id", sa.Uuid, primary_key=True),
                    sa.Column("project_id", sa.Integer), sa.Column("agent_binding_ref", sa.Uuid),
                    sa.Column("state", sa.String), schema=SCHEMA)
+APPLICATION = sa.Table("applications", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
+                       sa.Column("name", sa.String), schema=SCHEMA)
+VERSION = sa.Table("application_versions", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
+                   sa.Column("name", sa.String), schema=SCHEMA)
+TOOL = sa.Table("elitea_tools", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
+                sa.Column("type", sa.String), sa.Column("name", sa.String), schema=SCHEMA)
 AUDIT_OUTBOX = sa.Table("audit_outbox", TEST_TABLES, sa.Column("event_id", sa.String, primary_key=True),
                         sa.Column("body", sa.Text), schema=SCHEMA)
 
@@ -305,11 +311,12 @@ class FakeConfigurations:
         self.bundle_calls = []
         self.bundle_error = None
 
-    def add(self, project_id, *, type_="api_cred", section="credentials", secrets=None, generation=1):
+    def add(self, project_id, *, type_="api_cred", section="credentials", secrets=None, generation=1, title=None):
         rows = self.rows.setdefault(project_id, {})
         row = SimpleNamespace(
             id=len(rows) + 1, uuid=str(uuid.uuid4()), project_id=project_id, type=type_, section=section,
-            generation=generation, secrets=dict(secrets if secrets is not None else {"api_key": FIXTURE_VALUE}))
+            generation=generation, title=title,
+            secrets=dict(secrets if secrets is not None else {"api_key": FIXTURE_VALUE}))
         rows[row.id] = row
         return row
 
@@ -319,7 +326,7 @@ class FakeConfigurations:
 
     def configuration_credential_facts(self, project_id, uuids):
         return {row.uuid: {"id": row.id, "project_id": row.project_id, "type": row.type, "section": row.section,
-                           "generation": row.generation}
+                           "generation": row.generation, **({"title": row.title} if row.title else {})}
                 for row in self.rows.get(project_id, {}).values() if row.uuid in uuids}
 
     def configuration_secret_bundle(self, project_id, configuration_id, ctx):

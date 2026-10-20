@@ -259,11 +259,12 @@ def test_init_loads_the_methods_and_registers_the_credential_permissions(plugin)
     permissions = {entry["permissions"][0]: entry["recommended_roles"] for entry in plugin.registered
                    if entry["permissions"][0].startswith("credentials.")}
     assert sorted(permissions) == ["credentials.approve", "credentials.manage", "credentials.probe",
-                                   "credentials.reveal", "credentials.use"]
+                                   "credentials.reveal", "credentials.use", "credentials.view"]
     assert permissions["credentials.use"]["default"] == {"admin": True, "viewer": True, "editor": True}
     for name in ("credentials.manage", "credentials.probe", "credentials.approve"):
         assert permissions[name]["default"] == {"admin": True, "viewer": False, "editor": False}
-        assert permissions[name]["administration"] == {"admin": True, "viewer": False, "editor": False}
+        assert permissions[name]["administration"] == {
+            "super_admin": True, "admin": True, "viewer": False, "editor": False}
     assert not any(any(permissions["credentials.reveal"][mode].values()) for mode in ("default", "administration"))
     assert any(entry["permissions"] == ["configuration.secrets"] for entry in plugin.registered)  # untouched
 

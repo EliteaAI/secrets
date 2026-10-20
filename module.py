@@ -78,21 +78,22 @@ class Module(module.ModuleModel):
 
         # Credential governance (#6757, C-1009). Registered whatever the governance flag says, so roles can
         # be assigned before it is switched on. Only credentials.use is evaluated by the admission layer;
-        # reveal exists for a later governed reveal and is recommended to nobody.
-        for permission, default_roles in (
-                ("credentials.use", {"admin": True, "viewer": True, "editor": True}),
-                ("credentials.manage", {"admin": True, "viewer": False, "editor": False}),
-                ("credentials.probe", {"admin": True, "viewer": False, "editor": False}),
-                ("credentials.approve", {"admin": True, "viewer": False, "editor": False}),
-                ("credentials.reveal", {"admin": False, "viewer": False, "editor": False}),
+        # reveal exists for a later governed reveal and is recommended to nobody, and no route reads it.
+        # view, manage, probe and approve are what the operator REST API (#7119) checks, in administration mode.
+        from .utils import credential_api  # pylint: disable=C0415
+        for permission, roles in (
+                (credential_api.VIEW, credential_api.VIEW_ROLES),
+                (credential_api.MANAGE, credential_api.OPERATE_ROLES),
+                (credential_api.PROBE, credential_api.OPERATE_ROLES),
+                (credential_api.APPROVE, credential_api.OPERATE_ROLES),
+                ("credentials.use", {
+                    "administration": {"admin": True, "viewer": False, "editor": False},
+                    "default": {"admin": True, "viewer": True, "editor": True}}),
+                ("credentials.reveal", {
+                    "administration": {"admin": False, "viewer": False, "editor": False},
+                    "default": {"admin": False, "viewer": False, "editor": False}}),
         ):
-            auth.register_permissions({
-                "permissions": [permission],
-                "recommended_roles": {
-                    "administration": {"admin": default_roles["admin"], "viewer": False, "editor": False},
-                    "default": default_roles,
-                }
-            })
+            auth.register_permissions({"permissions": [permission], "recommended_roles": roles})
 
         self.descriptor.init_slots()
 
