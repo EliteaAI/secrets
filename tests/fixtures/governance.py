@@ -88,9 +88,9 @@ def _minimal_port_types():  # the shapes of shared/tools/secret_stores, enough f
             return f"STORE_{self.code}"
 
     seal = object()
-    purposes = frozenset({"onboard", "probe", "retire", "reconcile", "smoke"})
+    purposes = frozenset({"onboard", "probe", "retire", "reconcile", "smoke", "release"})
     operation_purposes = {
-        "read": {"probe", "reconcile", "smoke"}, "write": {"onboard"}, "metadata": {"probe", "reconcile", "smoke"},
+        "read": {"probe", "reconcile", "smoke", "release"}, "write": {"onboard"}, "metadata": {"probe", "reconcile", "smoke"},
         "delete_all": {"retire", "reconcile"},
     }
 

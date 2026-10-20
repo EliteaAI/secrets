@@ -125,14 +125,14 @@ def test_the_existing_api_layers_never_mention_the_store_or_the_engine():
     assert checked >= 8
 
 
-CUSTODY_MODULES = ("utils/credential_onboarding.py", "utils/credential_reconcile.py")
+CUSTODY_MODULES = ("utils/credential_onboarding.py", "utils/credential_reconcile.py", "utils/credential_release.py")
 
 
 def mint_users(tree):
     return [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr == "mint"]
 
 
-def test_only_onboarding_and_reconcile_mint_store_contexts():
+def test_only_the_custody_services_mint_store_contexts():
     seen = {}
     for relative, tree in python_files():
         if mint_users(tree) or "CredentialStoreProvider" in set(names_used(tree)):
@@ -147,7 +147,7 @@ def test_the_mint_lint_catches_a_stray_caller():
 
 STORE_CALLS = {  # store method -> the only modules that may call it
     "write": {"utils/credential_onboarding.py"},
-    "read": {"utils/credential_onboarding.py"},
+    "read": {"utils/credential_onboarding.py", "utils/credential_release.py"},
     "metadata": {"utils/credential_onboarding.py", "utils/credential_reconcile.py"},
     "delete_all": {"utils/credential_onboarding.py", "utils/credential_reconcile.py"},
     "smoke": {"utils/credential_reconcile.py"},
@@ -175,5 +175,5 @@ def test_a_store_context_cannot_be_built_by_hand(gov):
     with pytest.raises(TypeError):
         stores.AuthorizedStoreContext(purpose="onboard", decision_id="x", actor_ref="a", project_id=1, ref_id="r")
     with pytest.raises(ValueError):
-        stores.CredentialStoreProvider.mint("release", decision_id="x", actor_ref="a", project_id=1,
+        stores.CredentialStoreProvider.mint("unlisted", decision_id="x", actor_ref="a", project_id=1,
                                             ref_id=__import__("uuid").uuid4())
