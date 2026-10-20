@@ -3,6 +3,17 @@
 ``credential_use_facts`` answers what admission and the re-check of a queued run need: the live
 credential references of some configurations (or by reference id) and the live grants of some grant
 keys. Two bounded queries in the project's schema. Metadata only: no secret, no store locator.
+
+Personal references (#7119). A configuration can have a shared reference and one personal reference per owner. For a
+caller, the caller's own personal reference wins over the shared one *whatever its state*: a personal reference that is
+still pending, validated or suspended refuses the owner's runs until it is active (fail closed; the shared credential
+is never a silent fallback for someone who has registered their own). That reference carries a ``note`` saying so, for
+the UI to show.
+
+Known limits (follow-ups, no code yet): a mandate's owner is read at admission and a change of the owner after it is not
+re-read when a queued run is re-checked; the fallback query for a configuration with only other people's personal
+references is capped at ``MAX_SELECTORS`` rows, so one crowded configuration can crowd out another's fallback; and
+``ref_ids`` are keyed by configuration id, so two references of one configuration asked for together return one.
 """
 import uuid
 
@@ -67,12 +78,15 @@ def _iso(value):
 
 
 def _present(row) -> dict:
-    return {
+    facts = {
         "ref_id": str(row.id), "state": row.state, "generation": row.generation,
         "configuration_generation": row.configuration_generation, "store_kind": row.store_kind,
         "ownership_class": row.ownership_class, "revocation_epoch": row.revocation_epoch,
         "custodian_user_id": _custodian_user_id(row.custodian_ref),
         "custodian_subject_ref": _custodian_subject(row.custodian_ref)}
+    if row.ownership_class == "personal" and row.state != "active":
+        facts["note"] = f"personal reference {row.state}: runs of its owner are refused until it is active"
+    return facts
 
 
 def _caller_subject(personal_subject_ref, personal_user_id):

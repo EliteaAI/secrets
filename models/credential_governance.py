@@ -36,7 +36,7 @@ PERSONAL_INDEX = 'uq_credential_reference_live_personal'
 # Columns that never change after the row exists (approved_by is set once, see _ONCE)
 REFERENCE_IMMUTABLE = frozenset({
     'id', 'project_id', 'configuration_id', 'configuration_uuid', 'provider', 'auth_mode', 'ownership_class',
-    'target_ref', 'environment', 'store_kind', 'created_by',
+    'custodian_ref', 'target_ref', 'environment', 'store_kind', 'created_by',
 })
 GRANT_IMMUTABLE = frozenset({
     'id', 'project_id', 'application_id', 'subject_kind', 'subject_ref', 'agent_binding_ref',
@@ -104,6 +104,8 @@ class CredentialReference(db_tools.AbstractBaseMixin, db.Base):
     policy_revision: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_by: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # whoever committed the current generation (an import or a personal value); never the one who approves it
+    written_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     state_changed_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     revocation_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default='0')
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

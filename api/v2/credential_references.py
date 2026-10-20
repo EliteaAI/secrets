@@ -27,7 +27,11 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="Create Credential Reference (Admin)",
         description="Register a credential of the project for governed use. The reference starts pending; its "
-                    "secret is imported afterwards, on the server.",
+                    "secret is imported afterwards, on the server. A personal reference (ownership_class personal, "
+                    "with owner_user_id, a member of the project) stands beside the shared one and takes its value "
+                    "through the write-only value endpoint. Once its owner has one, the owner's runs use it and no "
+                    "other: while it is pending, validated or suspended they are refused, and they do not fall "
+                    "back to the shared credential.",
         parameters=[_PROJECT],
         request_body=api.ReferenceCreate,
         mcp_tool=False,

@@ -19,9 +19,10 @@ class Method:
 
         Second step, ``personal_index`` (#7119): in projects whose tables predate personal credential references,
         swaps the single live-reference unique index for two partial ones (one live non-personal reference per
-        configuration; one personal reference per owner of a configuration). Until it has run in a project, creating
-        a personal reference there is refused (``MIGRATION_REQUIRED``). It is reported under ``personal_index``
-        (``migrated`` = would swap, on a dry run).
+        configuration; one personal reference per owner of a configuration) and adds ``written_by`` (the startup
+        guard adds that column too). Until it has run in a project, creating a personal reference there is refused
+        (``MIGRATION_REQUIRED``). Each project waits at most 5 s for its table; one that is busy fails alone and the
+        step is repeated. It is reported under ``personal_index`` (``migrated`` = would swap, on a dry run).
 
         Param format (required):
             "project_id=<all|N>[;dry_run]"

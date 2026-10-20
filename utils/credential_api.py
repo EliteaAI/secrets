@@ -27,7 +27,9 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from . import credential_queries as queries
 from .credential_errors import MESSAGES, CredentialTaskError
 from .credential_grants import grant_key_by_id, parse_valid_until, run_grant_action
-from .credential_material import MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_FIELDS, write_material
+from .credential_material import (
+    MAX_BODY_BYTES as MAX_MATERIAL_BODY_BYTES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_BYTES, MAX_FIELDS, write_material,
+)
 from .credential_onboarding import (
     ACTIONS as REFERENCE_ACTIONS, ONBOARD_OWNERSHIP_CLASSES, ONBOARD_STORE_KINDS, run_reference_action,
 )
@@ -53,7 +55,6 @@ REFERENCE_ACTION_PERMISSION = {
 GRANT_ACTION_PERMISSION = {"approve": APPROVE, "suspend": MANAGE, "resume": MANAGE, "revoke": MANAGE}
 
 MAX_BODY_BYTES = 8192
-MAX_MATERIAL_BODY_BYTES = 16384  # the whole value body: at most MAX_FIELDS fields of MAX_FIELD_VALUE_CHARS each
 DEFAULT_LIMIT, MAX_LIMIT, MAX_SEARCH = 20, 100, 128
 MAX_OFFSET = 10_000_000
 MAX_INT32 = 2**31 - 1  # ids and limits are compared with 32-bit columns; a larger value would overflow in the database
@@ -64,7 +65,7 @@ SORT_ORDERS = ("asc", "desc")
 STATUS = {
     400: ("INVALID_REQUEST", "APPROVAL_REQUIRED", "CONFIGURATION_NOT_ELIGIBLE", "UNSUPPORTED_STORE_KIND",
           "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER"),
-    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED"),
+    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC"),
     404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
@@ -294,13 +295,13 @@ class ReferenceAction(_Approval):
 
     @root_validator
     def _check_only_for_probe(cls, values):  # pylint: disable=E0213
-        if values.get("check_connection") is not None and values.get("action") != "probe":
+        if values.get("check_connection") and values.get("action") != "probe":   # a false flag is ignored
             raise ValueError("only probe checks the connection")
         return values
 
 
 def _secret_text(value):
-    if not isinstance(value, str) or not 0 < len(value) <= MAX_FIELD_VALUE_CHARS:
+    if not isinstance(value, str) or not 0 < len(value.encode("utf-8")) <= MAX_FIELD_VALUE_BYTES:
         raise ValueError("bad value")   # the message never holds the value
     return value
 

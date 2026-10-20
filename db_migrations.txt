@@ -6,8 +6,8 @@
 Run admin task create_credential_governance_tables with param: project_id=all;dry_run
 Run admin task create_credential_governance_tables with param: project_id=all
 # Issue #7119 (C-1009): personal credential references. The same task now also swaps the single live-reference
-# unique index of credential_reference for a shared and a personal pair (step personal_index, reported under
-# personal_index). Until it has run in a project, creating a personal reference there is refused with
+# unique index of credential_reference for a shared and a personal pair and adds written_by (step personal_index,
+# reported under personal_index; a busy table fails that project after 5 s, run it again). Until it has run in a project, creating a personal reference there is refused with
 # MIGRATION_REQUIRED; every other class is unaffected. Idempotent. Run it again after this release.
 Run admin task create_credential_governance_tables with param: project_id=all;dry_run
 Run admin task create_credential_governance_tables with param: project_id=all

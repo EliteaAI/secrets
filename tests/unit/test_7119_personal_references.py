@@ -9,6 +9,7 @@ import ast
 import json
 import types
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,12 +18,12 @@ from flask import Flask, g
 from sqlalchemy.exc import IntegrityError
 
 from fixtures.api_loader import load_api_module
-from fixtures.governance import APPLICATION, BINDING, MANDATE, TOOL, TOOL_MAPPING, VERSION, Crash
+from fixtures.governance import APPLICATION, BINDING, MANDATE, PG_DSN, TOOL, TOOL_MAPPING, VERSION, Crash
 from run_tests import StubAuth, StubLog
 
 app = Flask(__name__)
 PROJECT, OTHER_PROJECT = 3, 4
-CREATOR, APPROVER, OWNER, OTHER_OWNER, UNLINKED, OUTSIDER = 10, 20, 30, 31, 40, 50
+CREATOR, APPROVER, OWNER, OTHER_OWNER, UNLINKED, OUTSIDER, WRITER = 10, 20, 30, 31, 40, 50, 60
 SECRET = "sentinel-personal-value-0001"  # fake, test only
 SECRET_2 = "sentinel-personal-value-0002"
 TOOLKIT = 41
@@ -44,7 +45,7 @@ class World:
         self.material = gov.module("utils.credential_material")
         self.onboarding = gov.module("utils.credential_onboarding")
         self.schema = gov.module("utils.credential_schema")
-        self.users = {CREATOR: user(CREATOR, "o10"), APPROVER: user(APPROVER, "o20"), OWNER: user(OWNER, "o30"),
+        self.users = {WRITER: user(WRITER, "o60"), CREATOR: user(CREATOR, "o10"), APPROVER: user(APPROVER, "o20"), OWNER: user(OWNER, "o30"),
                       OTHER_OWNER: user(OTHER_OWNER, "o31"), UNLINKED: user(UNLINKED, None), OUTSIDER: user(OUTSIDER, "o50")}
         self.members = [CREATOR, APPROVER, OWNER, OTHER_OWNER, UNLINKED]
         self.permissions = {"credentials.view", "credentials.manage", "credentials.probe", "credentials.approve"}
@@ -145,18 +146,25 @@ class World:
             session.commit()
         return f"mandate:{mandate}"
 
-    def legacy_indexes(self, project=PROJECT):
-        """The schema of a project that predates personal references: the one live-reference index."""
+    def legacy_indexes(self, project=PROJECT, drop_column=False):
+        """The schema of a project that predates personal references: the one live-reference index (and no
+        ``written_by`` column, with ``drop_column``: the model cannot be used on such a project until the step has run)."""
         self.gov.db.execute(project, "SELECT 1")  # make sure the engine and tables exist
         self.gov.db.execute(project, "DROP INDEX IF EXISTS tenant.uq_credential_reference_live_shared")
         self.gov.db.execute(project, "DROP INDEX IF EXISTS tenant.uq_credential_reference_live_personal")
         self.gov.db.execute(
             project, "CREATE UNIQUE INDEX uq_credential_reference_live_configuration "
                      "ON tenant.credential_reference (configuration_id) WHERE state <> 'retired'")
+        if drop_column:
+            self.gov.db.execute(project, "ALTER TABLE tenant.credential_reference DROP COLUMN written_by")
 
     def index_names(self, project=PROJECT):
         with self.gov.db.get_session(project) as session:
             return self.schema._index_names(session)  # pylint: disable=W0212
+
+    def column_names(self, project=PROJECT):
+        with self.gov.db.get_session(project) as session:
+            return self.schema._column_names(session)  # pylint: disable=W0212
 
 
 @pytest.fixture
@@ -440,8 +448,9 @@ def test_a_type_with_no_known_secret_fields_or_no_schema_service_is_refused(w):
     assert w.store().calls == []
 
 
-def raw_body(first, second, generation):
-    return json.dumps({"fields": {"f.0": first, "f.1": second}, "expected_generation": generation}, separators=(",", ":"))
+def raw_body(values, generation):
+    return json.dumps({"fields": {f"f.{i}": value for i, value in enumerate(values)}, "expected_generation": generation},
+                      separators=(",", ":"))
 
 
 def test_the_body_is_bounded_before_it_is_parsed(w):
@@ -449,20 +458,23 @@ def test_the_body_is_bounded_before_it_is_parsed(w):
     w.gov.configurations.secret_paths["api_cred"] = ["f.*"]
     assert w.put(ref, {"f.0": "x" * 8192})[1] == 200                                      # the largest single value
     assert w.put(ref, {"f.0": "x" * 8193}, expected_generation=1)[0]["code"] == "INVALID_REQUEST"   # one more
+    assert w.put(ref, {"f.0": "é" * 4096}, expected_generation=1)[1] == 200               # 8 KiB as UTF-8
+    assert w.put(ref, {"f.0": "é" * 4097}, expected_generation=2)[0]["code"] == "INVALID_REQUEST"    # more bytes, fewer characters
     many = {f"f.{i}": "v" for i in range(32)}
-    assert w.put(ref, many, expected_generation=1)[1] == 200                              # 32 fields
-    assert w.put(ref, {**many, "f.32": "v"}, expected_generation=2)[0]["code"] == "INVALID_REQUEST"   # 33
-    cap = 16384
-    padding = cap - len(raw_body("x" * 8192, "", 2))
-    at_cap = raw_body("x" * 8192, "y" * padding, 2)
+    assert w.put(ref, many, expected_generation=2)[1] == 200                              # 32 fields
+    assert w.put(ref, {**many, "f.32": "v"}, expected_generation=3)[0]["code"] == "INVALID_REQUEST"   # 33
+    cap = 32 * 1024
+    big = ["x" * 8192] * 3
+    padding = cap - len(raw_body([*big, ""], 3))
+    at_cap = raw_body([*big, "y" * padding], 3)
     assert len(at_cap.encode()) == cap
     reply = w.call("credential_material", "put", PROJECT, uuid.UUID(ref), raw=at_cap)
     assert reply[1] == 200                                                                # the body at the cap is read
-    over = raw_body("x" * 8192, "y" * (padding + 1), 3)
+    over = raw_body([*big, "y" * (padding + 1)], 4)
     assert len(over.encode()) == cap + 1
     body, status = w.call("credential_material", "put", PROJECT, uuid.UUID(ref), raw=over)
     assert (status, body["code"]) == (413, "REQUEST_TOO_LARGE")                           # one byte more is not
-    assert w.row(ref).generation == 3 and "y" * 50 not in everything_observable(w, body)
+    assert w.row(ref).generation == 4 and "y" * 50 not in everything_observable(w, body)
 
 
 @pytest.mark.parametrize("raw, content_type, status", [
@@ -710,9 +722,11 @@ def test_check_connection_tests_the_stored_value_as_its_owner_and_validates(w):
     body, status = w.action(ref, "probe", check_connection=True)
     assert (status, body) == (200, {"ok": True, "action": "probe", "id": ref, "generation": 1, "state": "validated",
                                     "connection_checked": True})
-    assert w.gov.core.checks == [(PROJECT, w.config.uuid, "api_cred", OWNER)]
+    # the operator probes; the custodian's reference is the one probed; the pending value is admitted for it
+    assert w.gov.core.checks == [(PROJECT, w.config.uuid, "api_cred", OWNER, CREATOR, True)]
     assert w.row(ref).state == "validated"
-    assert "CREDENTIAL_CONNECTION_CHECKED" in w.reasons()
+    reasons = w.reasons()
+    assert reasons.index("CREDENTIAL_CONNECTION_CHECKED") < reasons.index("CREDENTIAL_REF_VALIDATED")   # checked first
 
 
 def test_a_provider_that_refuses_the_credential_sends_the_reference_back_to_pending(w):
@@ -723,14 +737,25 @@ def test_a_provider_that_refuses_the_credential_sends_the_reference_back_to_pend
     assert (status, body) == (409, {"error": "The provider did not accept the stored credential.",
                                     "code": "CHECK_CONNECTION_FAILED"})
     row = w.row(ref)
-    assert (row.state, row.validated_generation) == ("pending", None)           # it cannot be approved on this value
+    assert (row.state, row.validated_generation) == ("pending", None)           # it was never validated: nothing to revert
+    assert "CREDENTIAL_REF_VALIDATED" not in w.reasons()
     failed = [e for e in w.events() if e["reason_code"] == "CREDENTIAL_CONNECTION_CHECK_FAILED"]
     assert failed and failed[0]["outcome"] == "failed" and failed[0]["event_type"] == "probe"
     assert SECRET not in everything_observable(w, body)                          # the provider's text is not repeated
 
 
+def test_an_operator_who_may_not_probe_is_told_so_with_a_403(w):
+    ref = w.personal()
+    w.put(ref)
+    w.gov.core.check_answer = {"success": False, "code": "DENIED_RBAC", "message": "m"}
+    body, status = w.action(ref, "probe", check_connection=True)
+    assert (status, body) == (403, {"error": "You do not have permission to test saved credentials.",
+                                    "code": "DENIED_RBAC"})
+    assert w.row(ref).state == "pending" and "CREDENTIAL_CONNECTION_CHECK_FAILED" in w.reasons()
+
+
 @pytest.mark.parametrize("answer, error", [
-    ({"success": False, "code": "DENIED_RBAC", "message": "m"}, None),
+    ({"success": False, "code": "WORKER_CAPABILITY_UNAVAILABLE", "message": "m"}, None),
     ({"success": False, "requires_authorization": True, "message": "m"}, None),
     ("nonsense", None), ({}, None), (None, None),
     (None, RuntimeError("worker down")),
@@ -866,10 +891,28 @@ def test_the_facts_prefer_the_callers_personal_reference_else_the_shared_one(w, 
 
 
 def test_the_facts_return_another_owners_personal_reference_only_when_nothing_else_exists(w, facts):
-    ids = trio(w, with_shared=False)
-    got = facts(PROJECT, [ids["config"]], [], personal_subject_ref="idp:t1:nobody")["references"][ids["config"]]
-    assert got["ownership_class"] == "personal" and got["custodian_subject_ref"] in (OWNER_SUBJECT, OTHER_SUBJECT)
-    assert facts(PROJECT, [ids["config"]], [])["references"][ids["config"]]["ownership_class"] == "personal"
+    config = w.gov.configurations.add(PROJECT)
+    common = dict(configuration_id=config.id, configuration_uuid=uuid.UUID(config.uuid), state="active",
+                  ownership_class="personal")
+    older = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first = str(w.gov.add_reference(
+        PROJECT, custodian_ref={"user_id": OTHER_OWNER, "subject_ref": OTHER_SUBJECT}, created_at=older, **common))
+    w.gov.add_reference(
+        PROJECT, custodian_ref={"user_id": OWNER, "subject_ref": OWNER_SUBJECT}, created_at=older + timedelta(days=1),
+        **common)
+    for kwargs in ({"personal_subject_ref": "idp:t1:nobody"}, {}):
+        got = facts(PROJECT, [config.id], [], **kwargs)["references"][config.id]
+        assert (got["ref_id"], got["custodian_subject_ref"]) == (first, OTHER_SUBJECT)   # the oldest, always the same
+
+
+def test_a_personal_reference_that_is_not_active_says_so_in_one_sentence(w, facts):
+    ids = trio(w)
+    assert w.action(ids["mine"], "suspend")[1] == 200
+    mine = facts(PROJECT, [ids["config"]], [], personal_subject_ref=OWNER_SUBJECT)["references"][ids["config"]]
+    assert mine["ref_id"] == ids["mine"] and mine["state"] == "suspended"   # it wins even though it is not in use
+    assert mine["note"] == "personal reference suspended: runs of its owner are refused until it is active"
+    other = facts(PROJECT, [ids["config"]], [], personal_subject_ref=OTHER_SUBJECT)["references"][ids["config"]]
+    assert "note" not in other and "note" not in facts(PROJECT, [], [], ref_ids=[ids["shared"]])["references"][ids["config"]]
 
 
 def test_the_facts_by_reference_id_return_exactly_that_reference_and_name_its_owner(w, facts):
@@ -905,3 +948,163 @@ def test_many_configurations_are_read_in_a_fixed_number_of_queries(w, facts):
     result = facts(PROJECT, [i["config"] for i in ids], [], personal_subject_ref=OWNER_SUBJECT)
     assert {picked(result, i["config"]) for i in ids} == {i["mine"] for i in ids}
     assert len(queries) <= 2
+
+
+# --- review fixes: the schema step -----------------------------------------------------------------------------------------
+
+def test_the_step_is_not_applied_while_the_legacy_index_is_still_there(w):
+    w.create(None, ownership_class="service")
+    w.gov.db.execute(PROJECT, "CREATE UNIQUE INDEX uq_credential_reference_live_configuration "
+                              "ON tenant.credential_reference (configuration_id) WHERE state <> 'retired'")
+    names = w.index_names()
+    assert {"uq_credential_reference_live_shared", "uq_credential_reference_live_personal"} <= names
+    with w.gov.db.get_session(PROJECT) as session:
+        assert w.schema.personal_index_applied(session) is False and w.schema.personal_schema_applied(session) is False
+    assert w.create()[0]["code"] == "MIGRATION_REQUIRED"
+    assert w.schema.apply_personal_index([PROJECT]) == ([PROJECT], [])
+    assert "uq_credential_reference_live_configuration" not in w.index_names() and w.create()[1] == 201
+
+
+def test_a_project_without_the_written_by_column_is_swapped_and_gets_it(w):
+    w.create(None, ownership_class="service")
+    w.legacy_indexes(drop_column=True)
+    assert "written_by" not in w.column_names()
+    assert w.schema.project_ids_missing_personal_index([PROJECT]) == [PROJECT]
+    assert w.schema.apply_personal_index([PROJECT], dry_run=True) == ([PROJECT], []) and "written_by" not in w.column_names()
+    assert w.schema.apply_personal_index([PROJECT]) == ([PROJECT], [])
+    assert "written_by" in w.column_names() and w.schema.project_ids_missing_personal_index([PROJECT]) == []
+    assert w.create()[1] == 201
+
+
+def test_the_column_alone_is_added_by_the_startup_safety_net_function(w):
+    w.create(None, ownership_class="service")
+    w.gov.db.execute(PROJECT, "ALTER TABLE tenant.credential_reference DROP COLUMN written_by")
+    assert w.schema.apply_written_by([PROJECT]) == ([PROJECT], [])
+    assert "written_by" in w.column_names()
+    assert w.schema.apply_written_by([PROJECT]) == ([PROJECT], [])   # idempotent
+
+
+def test_the_swap_takes_a_lock_timeout_on_postgresql_only(w):
+    class Connection:
+        def __init__(self, name):
+            self.dialect, self.statements = types.SimpleNamespace(name=name), []
+
+        def execute(self, statement):
+            self.statements.append(str(statement))
+
+    postgres, sqlite = Connection("postgresql"), Connection("sqlite")
+    w.schema._set_lock_timeout(postgres)   # pylint: disable=W0212
+    w.schema._set_lock_timeout(sqlite)     # pylint: disable=W0212
+    assert postgres.statements == ["SET LOCAL lock_timeout = '5s'"] and sqlite.statements == []
+
+
+@pytest.mark.skipif(not PG_DSN, reason="needs PostgreSQL (ELITEA_TEST_PG_DSN)")
+def test_a_busy_table_fails_that_project_alone_after_the_lock_timeout(w, monkeypatch):
+    w.create(None, ownership_class="service")
+    w.legacy_indexes()
+    monkeypatch.setattr(w.schema, "LOCK_TIMEOUT", "300ms")
+    engine = w.gov.db.engine(PROJECT)
+    with engine.connect() as holder:   # another session holds the table
+        schema = engine.get_execution_options()["schema_translate_map"]["tenant"]
+        holder.execute(sa.text(f'LOCK TABLE "{schema}".credential_reference IN ACCESS EXCLUSIVE MODE'))
+        migrated, failed = w.schema.apply_personal_index([PROJECT])
+        holder.rollback()
+    assert (migrated, failed) == ([], [{"project_id": PROJECT}])
+    assert "uq_credential_reference_live_configuration" in w.index_names()   # nothing half-applied
+    assert w.schema.apply_personal_index([PROJECT]) == ([PROJECT], [])        # and the step is repeated
+
+
+# --- review fixes: who writes, who approves, rotation -----------------------------------------------------------------
+
+def test_whoever_wrote_the_value_cannot_approve_it(w):
+    ref = w.personal()
+    assert w.put(ref, actor=WRITER)[1] == 200
+    assert w.row(ref).written_by == WRITER and w.row(ref).created_by == CREATOR
+    assert w.action(ref, "probe", actor=APPROVER)[1] == 200
+    body, status = w.action(ref, "approve", actor=WRITER, approval_ref="CHG-1", policy_revision="rev-1")
+    assert (status, body["code"]) == (403, "SELF_APPROVAL")
+    body, status = w.action(ref, "approve", actor=CREATOR, approval_ref="CHG-1", policy_revision="rev-1")
+    assert (status, body["code"]) == (403, "SELF_APPROVAL")
+    assert w.action(ref, "approve", actor=APPROVER, approval_ref="CHG-1", policy_revision="rev-1")[1] == 200
+
+
+def test_a_new_value_replaces_the_writer_and_an_import_records_one_too(w):
+    ref = w.personal()
+    w.put(ref, actor=WRITER)
+    w.put(ref, {"api_key": SECRET_2}, expected_generation=1, actor=APPROVER)
+    assert w.row(ref).written_by == APPROVER
+    shared = w.create(None, ownership_class="service")[0]["id"]
+    assert w.action(shared, "import", actor=WRITER)[1] == 200 and w.row(shared).written_by == WRITER
+    w.action(shared, "probe")
+    body, status = w.action(shared, "approve", actor=WRITER, approval_ref="CHG-1", policy_revision="rev-1")
+    assert (status, body["code"]) == (403, "SELF_APPROVAL")
+
+
+def test_the_lists_name_the_writer(w):
+    ref = w.personal()
+    w.put(ref, actor=WRITER)
+    [row] = w.call("credential_references", "get", PROJECT)[0]["rows"]
+    assert row["written_by"] == {"id": WRITER, "email": f"u{WRITER}@x.test"}
+
+
+def test_a_suspended_reference_takes_a_new_value_and_keeps_its_grants(w):
+    ref = w.personal()
+    w.lifecycle(ref)
+    binding = w.seed_binding()
+    grant = w.call("credential_grants", "post", PROJECT, body={
+        "agent_binding_ref": binding, "toolkit_id": TOOLKIT, "credential_ref": ref, "subject_user_id": OWNER})[0]["id"]
+    assert w.put(ref, {"api_key": SECRET_2}, expected_generation=1)[0]["code"] == "INVALID_STATE"   # not while it is in use
+    assert w.action(ref, "suspend")[1] == 200
+    body, status = w.put(ref, {"api_key": SECRET_2}, expected_generation=1, actor=WRITER)
+    assert (status, body) == (200, {"ok": True, "generation": 2, "state": "pending"})
+    for step, who in (("probe", CREATOR),):
+        assert w.action(ref, step, actor=who)[1] == 200
+    assert w.action(ref, "approve", actor=APPROVER, approval_ref="CHG-2", policy_revision="rev-2")[1] == 200
+    assert w.action(ref, "activate", actor=APPROVER)[0]["state"] == "active"
+    row = w.row(ref)
+    assert (row.generation, row.validated_generation, row.written_by) == (2, 2, WRITER)
+    assert w.gov.grant(PROJECT, uuid.UUID(grant)).credential_ref == uuid.UUID(ref)
+    assert w.store().versions[uuid.UUID(ref)] == {1: {"api_key": SECRET}, 2: {"api_key": SECRET_2}}
+
+
+def test_a_retired_reference_takes_no_value(w):
+    ref = w.personal()
+    w.action(ref, "retire")
+    assert w.put(ref)[0]["code"] == "INVALID_STATE"
+
+
+# --- review fixes: the value is complete, and the flags --------------------------------------------------------------------
+
+def test_a_value_holds_every_secret_field_of_the_type_but_a_wildcard_needs_none(w):
+    w.gov.configurations.secret_paths["api_cred"] = ["api_key", "client_secret", "headers.*"]
+    ref = w.personal()
+    for partial in ({"api_key": SECRET}, {"client_secret": SECRET}, {"headers.X": SECRET}, {"api_key": SECRET, "headers.X": SECRET}):
+        body, status = w.put(ref, partial)
+        assert (status, body) == (400, {"error": "The request is not valid.", "code": "INVALID_REQUEST"}), partial
+    assert w.store().calls == [] and w.gov.ledger(PROJECT) == []
+    assert w.put(ref, {"api_key": SECRET, "client_secret": SECRET_2})[1] == 200                  # no map entries needed
+    assert w.put(ref, {"api_key": SECRET, "client_secret": SECRET_2, "headers.X": "h"}, expected_generation=1)[1] == 200
+
+
+def test_a_false_check_connection_is_accepted_and_ignored_on_any_action(w):
+    shared = w.create(None, ownership_class="service")[0]["id"]
+    assert w.action(shared, "import", check_connection=False)[1] == 200
+    assert w.action(shared, "probe", check_connection=False)[1] == 200
+    assert w.action(shared, "suspend", check_connection=True)[0]["code"] == "INVALID_REQUEST"
+
+
+# --- review fixes: the onboarding probe may release a pending value ------------------------------------------------------------
+
+def test_the_release_serves_a_pending_value_only_to_the_onboarding_probe(w):
+    ref = w.personal()
+    w.put(ref)
+    release = w.gov.module("utils.credential_release")
+    args = (PROJECT, ref, 1, str(uuid.uuid4()), "user:1")
+    assert release.release_material(*args) == {"ok": False, "reason_code": "CREDENTIAL_REFERENCE_INACTIVE"}
+    assert release.release_material(*args, allow_validated=True)["reason_code"] == "CREDENTIAL_REFERENCE_INACTIVE"
+    got = release.release_material(*args, allow_pending=True)
+    assert got["ok"] is True and got["value"].fields["api_key"].get_secret_value() == SECRET
+    assert release.release_material(PROJECT, ref, 2, str(uuid.uuid4()), "user:1", allow_pending=True)["reason_code"] \
+        == "CREDENTIAL_GENERATION_MISMATCH"
+    w.action(ref, "retire")
+    assert release.release_material(*args, allow_pending=True)["reason_code"] == "CREDENTIAL_REFERENCE_INACTIVE"

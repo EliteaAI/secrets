@@ -8,7 +8,11 @@ settles exactly as it settles an import.
 
 The value is never read back, logged, audited or put in a result: events carry ids and the generation only (no value, no
 length, no field name), and a refusal is a fixed code. A committed write puts the reference back to ``pending``: the new
-value has to be probed and approved again.
+value has to be probed and approved again, by someone other than its creator and the writer (``written_by``). A
+``suspended`` reference takes a new value too: suspend, write, probe, approve, activate is the rotation path, and the
+grants keep the reference id.
+
+A value holds every secret field of the type (a ``<path>.*`` map or array of secrets is exempt: any keys under it).
 """
 import uuid
 
@@ -22,12 +26,14 @@ from .credential_onboarding import (
     _configuration_facts, _event, _import_failed, _load, _open_ledger, write_to_store,
 )
 from .credential_schema import project_tx
-from .credential_state import InvalidTransition, claim_generation, commit_generation, set_ledger_state
+from .credential_state import (
+    WRITABLE_STATES, InvalidTransition, claim_generation, commit_generation, set_ledger_state,
+)
 
 MAX_FIELDS = 32
-MAX_FIELD_VALUE_CHARS = 8192
+MAX_FIELD_VALUE_BYTES = 8 * 1024   # one value, as UTF-8
+MAX_BODY_BYTES = 32 * 1024         # the request body, all fields together
 MAX_FIELD_NAME_CHARS = 128
-WRITABLE_STATES = ("pending", "validated")
 
 
 def _field_allowed(name, paths) -> bool:
@@ -54,27 +60,29 @@ def _secret_field_paths(provider) -> list:
 def _as_secrets(fields) -> dict:
     """The fields as the store port wants them (``pydantic.SecretStr``), whatever secret type the request model used
     (the REST models are pydantic v1) and only if they are bounded: at most ``MAX_FIELDS`` fields, each a non-empty
-    text of at most ``MAX_FIELD_VALUE_CHARS`` under a name of at most ``MAX_FIELD_NAME_CHARS``."""
+    text of at most ``MAX_FIELD_VALUE_BYTES`` under a name of at most ``MAX_FIELD_NAME_CHARS``."""
     if not isinstance(fields, dict) or not 0 < len(fields) <= MAX_FIELDS:
         raise CredentialTaskError("INVALID_REQUEST")
     secrets = {}
     for name, secret in fields.items():
         value = secret.get_secret_value() if hasattr(secret, "get_secret_value") else secret
         if (not isinstance(name, str) or not 0 < len(name) <= MAX_FIELD_NAME_CHARS
-                or not isinstance(value, str) or not 0 < len(value) <= MAX_FIELD_VALUE_CHARS):
+                or not isinstance(value, str) or not 0 < len(value.encode("utf-8")) <= MAX_FIELD_VALUE_BYTES):
             raise CredentialTaskError("INVALID_REQUEST")
         secrets[name] = SecretStr(value)
     return secrets
 
 
 def _check_names(fields, paths):
-    """Only the secret fields of the type."""
+    """Only the secret fields of the type, and every one of them (a wildcard path needs none)."""
     if not all(_field_allowed(name, paths) for name in fields):
+        raise CredentialTaskError("INVALID_REQUEST")
+    if not {path for path in paths if not path.endswith(".*")} <= set(fields):
         raise CredentialTaskError("INVALID_REQUEST")
 
 
 def _require_writable(ref, expected_generation):
-    """A personal reference that has not been approved yet, at the generation the caller saw."""
+    """A personal reference that is not in use (pending, validated or suspended), at the generation the caller saw."""
     if ref.ownership_class != "personal":
         raise CredentialTaskError("PERSONAL_ONLY")
     if ref.state not in WRITABLE_STATES:
@@ -118,7 +126,7 @@ def _write(project_id, ref_id, fields, expected_generation, actor):
         set_ledger_state(session, ledger_id, ("intent",), "written")
         session.commit()
     with project_tx(project_id) as session:
-        if not commit_generation(session, ref.id, generation, facts.get("generation")):
+        if not commit_generation(session, ref.id, generation, facts.get("generation"), written_by=actor):
             session.rollback()
             raise CredentialTaskError("CONCURRENT_CHANGE")
         set_ledger_state(session, ledger_id, ("intent", "written"), "committed")

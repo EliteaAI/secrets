@@ -303,10 +303,13 @@ def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
     assert gov.admin.tasks == {}
 
 
-def run_guard(plugin, monkeypatch, gov, pending, apply=None):
+def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=()):
     monkeypatch.setattr(plugin.file, "Thread", lambda target, daemon: types.SimpleNamespace(start=target))
     schema = gov.module("utils.credential_schema")
     applied = []
+    plugin.written = []
+    monkeypatch.setattr(schema, "project_ids_missing_written_by", lambda: list(unwritten))
+    monkeypatch.setattr(schema, "apply_written_by", lambda ids: plugin.written.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_credential_tables",
                         pending if callable(pending) else (lambda: list(pending)))
     monkeypatch.setattr(schema, "apply_credential_tables", apply or (lambda ids: applied.append(list(ids)) or (ids, [])))
@@ -323,3 +326,9 @@ def test_a_failing_startup_guard_never_raises(gov, plugin, monkeypatch):
     def boom():
         raise RuntimeError("catalog down")
     assert run_guard(plugin, monkeypatch, gov, boom) == []
+
+
+def test_the_startup_guard_adds_the_written_by_column_where_it_is_missing(gov, plugin, monkeypatch):
+    assert run_guard(plugin, monkeypatch, gov, [], unwritten=[3, 9]) == [] and plugin.written == [[3, 9]]
+    assert run_guard(plugin, monkeypatch, gov, [4], unwritten=[]) == [[4]] and plugin.written == []   # tables first
+    assert run_guard(plugin, monkeypatch, gov, [], unwritten=[]) == [] and plugin.written == []        # steady state

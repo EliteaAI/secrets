@@ -31,7 +31,7 @@ from ..models.credential_governance import CredentialReference, CredentialStoreL
 from . import credential_audit as audit
 from .credential_errors import CredentialTaskError, require_actor, store_error_result
 from .credential_queries import subject_ref_of_user
-from .credential_schema import personal_index_applied, project_tx
+from .credential_schema import personal_schema_applied, project_tx
 from .credential_state import (
     InvalidTransition, approve_reference, claim_generation, commit_generation, release_generation,
     set_ledger_state, transition_reference,
@@ -263,11 +263,11 @@ def _create(values, actor):
     if values["dry_run"]:
         if personal:
             with project_tx(project_id) as session:
-                if not personal_index_applied(session):
+                if not personal_schema_applied(session):
                     raise CredentialTaskError("MIGRATION_REQUIRED")
         return {"dry_run": True, "action": "create", "state": "pending", "provider": facts["type"]}
     with project_tx(project_id) as session:
-        if personal and not personal_index_applied(session):   # the old index would allow one reference per configuration
+        if personal and not personal_schema_applied(session):   # the old index would allow one reference per configuration
             raise CredentialTaskError("MIGRATION_REQUIRED")
         if session.execute(live).first() is not None:
             raise CredentialTaskError("REFERENCE_EXISTS")
@@ -324,7 +324,7 @@ def _import(values, actor):  # pylint: disable=R0914
         set_ledger_state(session, ledger_id, ("intent",), "written")
         session.commit()
     with project_tx(project_id) as session:
-        if not commit_generation(session, ref.id, generation, bundle["configuration_generation"]):
+        if not commit_generation(session, ref.id, generation, bundle["configuration_generation"], written_by=actor):
             session.rollback()
             raise CredentialTaskError("CONCURRENT_CHANGE")
         set_ledger_state(session, ledger_id, ("intent", "written"), "committed")
@@ -380,21 +380,24 @@ def _probe_store(project_id, ref, ctx):
     return request_id
 
 
-def _check_connection(project_id, ref):
-    """Test a personal reference's stored value against its provider, as its owner (the governed check admits no one
-    else). Raises ``CHECK_CONNECTION_FAILED`` when the provider refuses the credential and
-    ``CHECK_CONNECTION_REFUSED`` when the check could not run (permission, worker, store, audit). The answer is a code
-    only: the provider's own text can echo what it was given."""
+def _check_connection(project_id, ref, actor):
+    """Test a personal reference's stored value against its provider. The operator (``actor``, already authorised by the
+    REST layer) holds ``credentials.probe``; the personal reference probed is its custodian's. Raises
+    ``CHECK_CONNECTION_FAILED`` when the provider refuses the credential, ``DENIED_RBAC`` when the actor may not probe,
+    and ``CHECK_CONNECTION_REFUSED`` when the check could not run (worker, store, audit). The answer is a code only:
+    the provider's own text can echo what it was given."""
     owner = (_custodian(ref) or {}).get("user_id")
     try:
         answer = this.for_module("elitea_core").module.governed_check_connection(
-            project_id, str(ref.configuration_uuid), ref.provider, owner)
+            project_id, str(ref.configuration_uuid), ref.provider, owner, actor_user_id=actor, onboarding=True)
     except Exception:  # pylint: disable=W0703
         raise CredentialTaskError("CHECK_CONNECTION_REFUSED") from None
     if not isinstance(answer, dict) or answer.get("requires_authorization") or answer.get("success") not in (True, False):
         raise CredentialTaskError("CHECK_CONNECTION_REFUSED")
     if answer["success"]:
         return
+    if answer.get("code") == "DENIED_RBAC":
+        raise CredentialTaskError("DENIED_RBAC")
     raise CredentialTaskError("CHECK_CONNECTION_REFUSED" if answer.get("code") else "CHECK_CONNECTION_FAILED")
 
 
@@ -428,6 +431,10 @@ def _probe(values, actor):  # pylint: disable=R0914
             session.commit()
         return store_error_result(exc) if is_store else exc.result()
     #
+    if check:   # before the reference is validated: a provider that refuses the value leaves it pending
+        failure = _connection_outcome(project_id, ref, actor)
+        if failure is not None:
+            return failure
     state = ref.state
     if state == "pending":
         with project_tx(project_id) as session:
@@ -443,25 +450,19 @@ def _probe(values, actor):  # pylint: disable=R0914
     result = {"action": "probe", "reference": values["ref"], "generation": ref.generation, "state": state,
               "dry_run": False}
     if check:
-        failure = _connection_outcome(project_id, ref, actor, validated_now=ref.state == "pending")
-        if failure is not None:
-            return failure
         result["connection_checked"] = True
     return result
 
 
-def _connection_outcome(project_id, ref, actor, validated_now):
-    """Run the connection check and record how it went. A reference this probe has just validated goes back to
-    ``pending`` when the check fails, so a credential the provider refuses cannot be approved. Returns the refusal
-    result, or ``None`` when the check passed."""
+def _connection_outcome(project_id, ref, actor):
+    """Run the connection check and record how it went (it changes no state). Returns the refusal result, or ``None``
+    when the check passed."""
     try:
-        _check_connection(project_id, ref)
+        _check_connection(project_id, ref, actor)
         failure, code = None, "CREDENTIAL_CONNECTION_CHECKED"
     except CredentialTaskError as exc:
         failure, code = exc, "CREDENTIAL_CONNECTION_CHECK_FAILED"
     with project_tx(project_id) as session:
-        if failure is not None and validated_now:
-            transition_reference(session, ref.id, "validated", "pending", actor=actor)
         audit.record(session, _event(
             code, ref, actor, event_type="probe", credential_generation=ref.generation,
             outcome="failed" if failure else "success"))
@@ -475,7 +476,7 @@ def _approve(values, actor):
         ref = _load(session, project_id, values["ref"])
         if ref.state != "validated" or ref.approved_by is not None:
             raise CredentialTaskError("INVALID_STATE")
-        if ref.created_by == actor:
+        if actor in (ref.created_by, ref.written_by):   # not the creator, and not whoever wrote this generation
             raise CredentialTaskError("SELF_APPROVAL")
         if values["dry_run"]:
             return {"dry_run": True, "action": "approve", "reference": values["ref"], "state": "validated"}

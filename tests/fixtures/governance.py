@@ -377,7 +377,7 @@ class FakeAdmin:
 class FakeCore:
     def __init__(self):
         self.revoked = []
-        self.checks = []  # (project_id, configuration_uuid, type, user_id) of governed_check_connection
+        self.checks = []  # (project_id, configuration_uuid, type, user_id, actor_user_id, onboarding) of governed_check_connection
         self.check_answer = {"success": True}
         self.check_error = None
 
@@ -385,8 +385,9 @@ class FakeCore:
         _ = session
         self.revoked.append(credential_ref)
 
-    def governed_check_connection(self, project_id, configuration_uuid, config_type, user_id):
-        self.checks.append((project_id, configuration_uuid, config_type, user_id))
+    def governed_check_connection(self, project_id, configuration_uuid, config_type, user_id, actor_user_id=None,
+                                  onboarding=False):
+        self.checks.append((project_id, configuration_uuid, config_type, user_id, actor_user_id, onboarding))
         if self.check_error:
             raise self.check_error
         return dict(self.check_answer)

@@ -13,9 +13,11 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
     @register_openapi(
         name="Write Personal Credential Value (Admin)",
         description="Write the value of a personal credential reference, replacing any earlier value as a new "
-                    "generation. Write-only: the value is never returned, logged or audited. The names must be secret "
-                    "fields of the configuration's type, at most 32 fields, and the body at most 16 KiB. The reference "
-                    "goes back to pending: the new value has to be probed and approved again.",
+                    "generation (a pending, validated or suspended reference takes one). Write-only: the value is "
+                    "never returned, logged or audited. The names must be the secret fields of the configuration's "
+                    "type, all of them: at most 32 fields of at most 8 KiB each, and a body of at most 32 KiB. The "
+                    "reference goes back to pending: the new value has to be probed and approved again, by someone "
+                    "other than its creator and the one who wrote it.",
         parameters=[
             {"name": "project_id", "in": "path", "schema": {"type": "integer"}, "description": "Project identifier."},
             {"name": "ref_id", "in": "path", "schema": {"type": "string", "format": "uuid"},
