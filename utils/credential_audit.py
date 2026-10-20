@@ -22,9 +22,19 @@ def build_event(event_type, reason_code, *, project_id, actor_user_id, **fields)
             for key, value in event.items() if value is not None}
 
 
+class AuditUnavailable(RuntimeError):
+    """The audit trail did not take an event. The change it describes is not committed."""
+
+
 def record(session, event: dict) -> str:
-    """Add the event to ``session`` (no commit). Returns its ``event_id``; raises when the audit trail is down."""
-    return this.for_module("tracing").module.security_audit_record(session, event)["event_id"]
+    """Add the event to ``session`` (no commit). Returns its ``event_id``; raises ``AuditUnavailable`` when the
+    audit trail is down (a malformed event is a bug and keeps its own error)."""
+    try:
+        return this.for_module("tracing").module.security_audit_record(session, event)["event_id"]
+    except (ValueError, TypeError):
+        raise
+    except Exception:  # pylint: disable=W0703
+        raise AuditUnavailable("the audit trail is unavailable") from None
 
 
 def record_autocommit(event: dict) -> None:

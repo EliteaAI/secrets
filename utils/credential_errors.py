@@ -28,6 +28,16 @@ MESSAGES = {
     "UNSUPPORTED_STORE_KIND": "This store kind cannot be used for credential references.",
     "UNSUPPORTED_OWNERSHIP_CLASS": "This ownership class cannot be registered for governed use.",
     "DEPENDENCY_UNAVAILABLE": "A required service is unavailable; nothing was changed.",
+    # REST API only (#7119)
+    "INVALID_REQUEST": "The request is not valid.",
+    "REQUEST_TOO_LARGE": "The request is too large.",
+    "FORBIDDEN": "You do not have permission to do this.",
+    "SUBJECT_NOT_FOUND": "The user does not exist.",
+    "SUBJECT_UNLINKED": "The user has no linked identity-provider subject.",
+    "INVALID_TRANSITION": "This change is not allowed from the current state.",
+    "NOT_FOUND": "The project does not exist.",
+    "AUDIT_UNAVAILABLE": "The audit trail is unavailable.",
+    "FAILED": "The request failed.",
 }
 
 

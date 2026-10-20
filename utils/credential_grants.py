@@ -101,14 +101,24 @@ def parse_grant_param(param):
     if "valid_until" in values:
         if values["action"] != "create":
             return None, "valid_until applies to create only"
-        try:
-            until = datetime.fromisoformat(values["valid_until"])
-        except ValueError:
+        until, problem = parse_valid_until(values["valid_until"])
+        if problem == "format":
             return None, f"invalid valid_until: '{values['valid_until']}'"
-        if until.tzinfo is None or until <= datetime.now(timezone.utc):
+        if problem:
             return None, f"invalid valid_until: '{values['valid_until']}' (needs an offset and must be in the future)"
         values["valid_until"] = until
     return values, None
+
+
+def parse_valid_until(text):
+    """``(datetime, None)`` for an ISO-8601 time with an offset in the future, else ``(None, "format"|"range")``."""
+    try:
+        until = datetime.fromisoformat(text)
+    except ValueError:
+        return None, "format"
+    if until.tzinfo is None or until <= datetime.now(timezone.utc):
+        return None, "range"
+    return until, None
 
 
 def _find_grant(session, values):
@@ -244,12 +254,10 @@ def _move(values, actor):
 _ACTIONS = {"create": _create, "approve": _approve, "suspend": _move, "resume": _move, "revoke": _move}
 
 
-def manage_grant(param, actor_user_id=0):
-    """Run one grant action. Returns a result dict, or ``{"error": ..., "code": ...}`` with nothing written."""
-    values, error = parse_grant_param(param)
-    if error:
-        log.error("manage_credential_grant: %s", error)
-        return {"error": error}
+def run_grant_action(values, actor_user_id=0, audit_code=False):
+    """Run one grant action from parsed ``values`` (the admin task and the REST API both end here). Returns a
+    result dict, or ``{"error": ..., "code": ...}`` with nothing written. The task reports a down audit trail as
+    ``FAILED``; ``audit_code`` (the REST API) reports it as ``AUDIT_UNAVAILABLE``."""
     try:
         if not values["dry_run"]:
             require_actor(actor_user_id)
@@ -260,4 +268,28 @@ def manage_grant(param, actor_user_id=0):
         return {"error": f"{exc.reason_code}: {exc}", "code": exc.reason_code}
     except Exception as exc:  # pylint: disable=W0703
         log.error("manage_credential_grant: failed (%s)", type(exc).__name__)
-        return {"error": "failed; nothing was changed (is the audit trail available?)", "code": "FAILED"}
+        code = "AUDIT_UNAVAILABLE" if audit_code and isinstance(exc, audit.AuditUnavailable) else "FAILED"
+        return {"error": "failed; nothing was changed (is the audit trail available?)", "code": code}
+
+
+def manage_grant(param, actor_user_id=0):
+    """The admin task: parse the parameter string, then run the action."""
+    values, error = parse_grant_param(param)
+    if error:
+        log.error("manage_credential_grant: %s", error)
+        return {"error": error}
+    return run_grant_action(values, actor_user_id)
+
+
+def grant_key_by_id(project_id, grant_id):
+    """The natural key of one grant of the project, as ``run_grant_action`` takes it (``binding_ref``,
+    ``toolkit_id``, ``ref``, ``subject_ref``). A grant of another project is ``GRANT_NOT_FOUND``, like an unknown one."""
+    with project_tx(project_id) as session:
+        grant = session.execute(select(CredentialUseGrant).where(
+            CredentialUseGrant.id == uuid.UUID(str(grant_id)), CredentialUseGrant.project_id == project_id,
+            CredentialUseGrant.target_ref == ANY_TARGET,  # the row ``_find_grant`` will find again
+        )).scalar_one_or_none()
+        if grant is None:
+            raise CredentialTaskError("GRANT_NOT_FOUND")
+        return {"binding_ref": str(grant.agent_binding_ref), "toolkit_id": grant.toolkit_instance_id,
+                "ref": str(grant.credential_ref), "subject_ref": grant.subject_ref}

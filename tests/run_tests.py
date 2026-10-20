@@ -96,6 +96,8 @@ class StubAuth:
 
             def decorate(func):
                 StubAuth.decorators.requirements[func.__qualname__] = descriptor
+                # handler classes share names across files; this key tells them apart
+                StubAuth.decorators.requirements[f"{func.__module__}:{func.__qualname__}"] = descriptor
                 return func
 
             return decorate
