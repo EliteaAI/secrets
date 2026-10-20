@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from fixtures.governance import BINDING, TOOL_MAPPING
+from fixtures.governance import BINDING, MANDATE, TOOL_MAPPING
 
 PROJECT = 3
 CREATOR, APPROVER, OTHER = 10, 20, 30
@@ -27,6 +27,15 @@ def add_binding(gov, project_id=PROJECT, application_id=5, version_id=9, tools=(
                 tool_id=tool_id, entity_version_id=version_id, entity_type=entity_type))
         session.commit()
     return str(binding_ref)
+
+
+def add_mandate(gov, binding_ref, project_id=PROJECT, state="active"):
+    mandate_id = uuid.uuid4()
+    with gov.db.get_session(project_id) as session:
+        session.execute(MANDATE.insert().values(
+            id=mandate_id, project_id=project_id, agent_binding_ref=uuid.UUID(binding_ref), state=state))
+        session.commit()
+    return f"mandate:{mandate_id}"
 
 
 class Setup:
@@ -88,6 +97,13 @@ def base(**kw):
     (base(binding_ref="nope"), "invalid binding_ref"), (base(ref="nope"), "invalid ref"),
     (base(subject_ref="oid-1"), "invalid subject_ref"), (base(subject_ref="idp:t1"), "invalid subject_ref"),
     (base(subject_ref="idp:t1:u1:x"), "invalid subject_ref"), (base(subject_ref="idp:t 1:u1"), "invalid subject_ref"),
+    (base(subject_ref="mandate:"), "invalid subject_ref"), (base(subject_ref="mandate:123"), "invalid subject_ref"),
+    (base(subject_ref=f"mandate:{uuid.uuid4()}".upper()), "invalid subject_ref"),  # one spelling per id
+    (base(subject_ref=f"mandate:{uuid.uuid1()}"), "invalid subject_ref"),  # not a v4 id
+    (base(subject_ref=f"mandate:{uuid.uuid4()}:x"), "invalid subject_ref"),
+    (base(subject_ref=f"idp:t1:mandate:{uuid.uuid4()}"), "invalid subject_ref"),
+    (base(subject_ref=f"mandate:idp:t1:u1"), "invalid subject_ref"),
+    (base(subject_ref=f"{uuid.uuid4()}"), "invalid subject_ref"),
     (base(action="approve"), "approval_ref, policy_revision required"),
     (base() + ";surprise=1", "unknown parameter"),
     (base(valid_until="tomorrow"), "invalid valid_until"),
@@ -258,3 +274,97 @@ def test_another_project_cannot_reach_the_grant(gov, setup):
     gov.db.engine(PROJECT + 1)
     assert setup.run(APPROVER, project_id=PROJECT + 1, action="suspend")["code"] == "GRANT_NOT_FOUND"
     assert setup.row.state == "active"
+
+
+# --- mandate subjects (#6947) --------------------------------------------------------------------------------------
+
+def test_both_subject_shapes_parse_and_the_kind_follows_the_prefix(grants):
+    mandate = f"mandate:{uuid.uuid4()}"
+    for subject, kind in ((SUBJECT, "user_delegation"), (mandate, "mandate")):
+        values, error = grants.parse_grant_param(base(subject_ref=subject))
+        assert error is None and values["subject_ref"] == subject and grants.subject_kind(subject) == kind
+
+
+def test_a_mandate_grant_is_created_pending_with_the_mandate_kind_and_audited_by_mandate(gov, setup):
+    subject = add_mandate(gov, setup.binding, state="draft")  # a mandate can be prepared before it is approved
+    setup.create(subject_ref=subject)
+    row = setup.row
+    assert (row.subject_kind, row.subject_ref, row.state, row.created_by) == (
+        "mandate", subject, "pending_approval", CREATOR)
+    (event,) = setup.events
+    assert (event["reason_code"], event["mandate_ref"], event.get("user_ref")) == (
+        "GRANT_PENDING_APPROVAL", subject.partition(":")[2], None)
+
+
+@pytest.mark.parametrize("state", ["draft", "pending_approval", "active", "suspended"])
+def test_a_mandate_in_a_usable_or_preparable_state_accepts_a_grant(gov, setup, state):
+    assert "error" not in setup.run(action="create", subject_ref=add_mandate(gov, setup.binding, state=state))
+
+
+def test_mandate_grant_create_refusals_carry_a_code_and_no_id(gov, setup):
+    other_binding = add_binding(gov, version_id=10, tools=(TOOLKIT,))
+    cases = [
+        (f"mandate:{uuid.uuid4()}", "MANDATE_NOT_FOUND"),
+        (add_mandate(gov, setup.binding, project_id=PROJECT + 1), "MANDATE_NOT_FOUND"),  # a foreign project's mandate
+        (add_mandate(gov, other_binding), "MANDATE_BINDING_MISMATCH"),
+        (add_mandate(gov, setup.binding, state="revoked"), "MANDATE_INACTIVE"),
+        (add_mandate(gov, setup.binding, state="expired"), "MANDATE_INACTIVE"),
+    ]
+    for subject, code in cases:
+        result = setup.run(action="create", subject_ref=subject)
+        assert result["code"] == code, subject
+        assert subject.partition(":")[2] not in result["error"] and setup.binding not in result["error"]
+    assert setup.events == []
+
+
+def test_a_mandate_of_another_project_is_not_found_even_with_the_same_binding(gov, setup):
+    gov.db.engine(PROJECT + 1)
+    foreign = add_mandate(gov, setup.binding, project_id=PROJECT + 1)
+    assert setup.run(action="create", subject_ref=foreign)["code"] == "MANDATE_NOT_FOUND"
+
+
+def test_a_mandate_dry_run_checks_the_mandate_and_writes_nothing(gov, setup):
+    assert setup.run(0, dry_run=True, action="create", subject_ref=f"mandate:{uuid.uuid4()}")["code"] == "MANDATE_NOT_FOUND"
+    good = add_mandate(gov, setup.binding)
+    assert setup.run(0, dry_run=True, action="create", subject_ref=good) == {
+        "dry_run": True, "action": "create", "state": "pending_approval"}
+    assert setup.events == []
+
+
+def test_the_same_credential_can_be_granted_to_a_user_and_to_a_mandate(gov, setup):
+    setup.create()
+    assert "error" not in setup.run(action="create", subject_ref=add_mandate(gov, setup.binding))
+    assert setup.run(action="create", subject_ref=SUBJECT)["code"] == "GRANT_EXISTS"
+
+
+def test_a_mandate_grant_is_approved_by_someone_else_and_never_by_its_creator(gov, setup):
+    subject = add_mandate(gov, setup.binding)
+    setup.create(subject_ref=subject)
+    refused = setup.run(CREATOR, action="approve", subject_ref=subject, approval_ref="CHG-9", policy_revision="rev-9")
+    assert refused["code"] == "SELF_APPROVAL" and setup.row.state == "pending_approval"
+    result = setup.run(APPROVER, action="approve", subject_ref=subject, approval_ref="CHG-9", policy_revision="rev-9")
+    assert result["state"] == "active"
+    row = setup.row
+    assert (row.subject_kind, row.state, row.approved_by, row.approval_ref) == ("mandate", "active", APPROVER, "CHG-9")
+    event = setup.events[-1]
+    assert (event["event_type"], event["reason_code"], event["mandate_ref"]) == (
+        "approval", "GRANT_ACTIVE", subject.partition(":")[2])
+
+
+def test_a_mandate_grant_follows_the_same_lifecycle_moves(gov, setup):
+    subject = add_mandate(gov, setup.binding)
+    setup.create(subject_ref=subject)
+    setup.run(APPROVER, action="approve", subject_ref=subject, approval_ref="CHG-9", policy_revision="rev-9")
+    assert setup.run(APPROVER, action="suspend", subject_ref=subject)["state"] == "suspended"
+    assert setup.run(APPROVER, action="resume", subject_ref=subject)["state"] == "active"
+    assert setup.run(APPROVER, action="revoke", subject_ref=subject)["state"] == "revoked"
+    assert setup.row.revocation_epoch == 2
+
+
+def test_an_existing_mandate_grant_can_still_be_revoked_after_its_mandate_is_revoked(gov, setup):
+    subject = add_mandate(gov, setup.binding)
+    setup.create(subject_ref=subject)
+    with gov.db.get_session(PROJECT) as session:
+        session.execute(MANDATE.update().values(state="revoked"))
+        session.commit()
+    assert setup.run(APPROVER, action="revoke", subject_ref=subject)["state"] == "revoked"

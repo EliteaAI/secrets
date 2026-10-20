@@ -27,7 +27,8 @@ def test_references_are_keyed_by_configuration_id_with_the_documented_shape(gov,
     result = call(PROJECT, [row.configuration_id], [])
     assert result == {"references": {row.configuration_id: {
         "ref_id": str(ref_id), "state": "active", "generation": 1, "configuration_generation": 4,
-        "store_kind": "corporate_vault", "ownership_class": "service", "revocation_epoch": 2}}, "grants": {}}
+        "store_kind": "corporate_vault", "ownership_class": "service", "revocation_epoch": 2,
+        "custodian_user_id": None}}, "grants": {}}
 
 
 def test_ref_ids_find_the_same_rows_and_the_selectors_combine(gov, facts):
@@ -73,6 +74,7 @@ def test_grants_are_keyed_by_the_pipe_joined_key_in_tuple_or_dict_form(gov, fact
         found = result["grants"][text_key]
         assert (found["grant_id"], found["state"], found["revocation_epoch"], found["operations"]) == (
             str(grant_id), "active", 3, ["read"])
+        assert found["subject_kind"] == "user_delegation"
         assert found["valid_from"] and datetime.fromisoformat(found["valid_until"]).replace(tzinfo=timezone.utc) == \
             until.replace(tzinfo=timezone.utc, microsecond=until.microsecond)
 
@@ -151,4 +153,42 @@ def test_the_answer_has_no_locator_secret_or_store_path(gov, facts):
     grant = gov.grant(PROJECT, gov.add_grant(PROJECT, state="active"))
     blob = json.dumps(call(PROJECT, [ref.configuration_id], [grant_key(grant)]))
     for forbidden in ("locator", "credential_store", "section", "approval", "approved_by", "created_by"):
+        assert forbidden not in blob
+
+
+# --- WP-1C slice 1 (#6947): subject kind and custodian ------------------------------------------------------------------
+
+def test_the_facts_version_is_exported_where_a_startup_check_can_read_it(gov, facts):
+    _, method = facts
+    assert method.CREDENTIAL_FACTS_VERSION == 2 == method.Method.CREDENTIAL_FACTS_VERSION
+    assert method.Method.credential_facts_version(object()) == 2
+
+
+def test_grant_facts_carry_the_subject_kind_for_both_kinds(gov, facts):
+    call, _ = facts
+    mandate = f"mandate:{uuid.uuid4()}"
+    rows = [gov.grant(PROJECT, gov.add_grant(PROJECT, state="active", subject_ref=ref, subject_kind=kind))
+            for ref, kind in ((SUBJECT, "user_delegation"), (mandate, "mandate"))]
+    result = call(PROJECT, [], [grant_key(row) for row in rows])
+    kinds = {key.rpartition("|")[2]: fact["subject_kind"] for key, fact in result["grants"].items()}
+    assert kinds == {SUBJECT: "user_delegation", mandate: "mandate"}
+
+
+@pytest.mark.parametrize("custodian, expected", [
+    ({"user_id": 17}, 17), ({"user_id": 17, "other": 1}, 17), (None, None), ({}, None), ({"user_id": "17"}, None),
+    ({"user_id": True}, None), ({"user_id": None}, None), ({"team": 4}, None), (["user_id"], None),
+])
+def test_reference_facts_carry_the_custodian_user_id_or_none(gov, facts, custodian, expected):
+    call, _ = facts
+    ref = gov.reference(PROJECT, gov.add_reference(PROJECT, state="active", custodian_ref=custodian))
+    assert call(PROJECT, [ref.configuration_id], [])["references"][ref.configuration_id]["custodian_user_id"] == expected
+
+
+def test_the_new_facts_still_leave_out_the_locator_and_the_custodian_record(gov, facts):
+    call, _ = facts
+    ref = gov.reference(PROJECT, gov.add_reference(
+        PROJECT, state="active", custodian_ref={"user_id": 17, "note": "x"}, store_locator={"path": "secret/x"}))
+    blob = json.dumps(call(PROJECT, [ref.configuration_id], []))
+    assert "custodian_user_id" in blob
+    for forbidden in ("locator", "secret/x", "note", "custodian_ref"):
         assert forbidden not in blob
