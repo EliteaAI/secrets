@@ -118,7 +118,7 @@ def approve_grant(session, grant_id, *, actor: int, approval_ref: str, policy_re
         {"state": "active", "approved_by": actor, "approval_ref": approval_ref, "policy_revision": policy_revision,
          "state_changed_by": actor},
         model.state == "pending_approval", model.approved_by.is_(None), model.created_by != actor,
-        model.subject_kind == "user_delegation",
+        model.subject_kind.in_(("user_delegation", "mandate")),
     )
 
 

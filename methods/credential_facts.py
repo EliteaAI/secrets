@@ -13,6 +13,8 @@ from tools import db  # pylint: disable=E0401
 from ..models.credential_governance import CredentialReference, CredentialUseGrant
 
 MAX_SELECTORS = 64
+# 2: grant facts carry ``subject_kind`` and reference facts ``custodian_user_id`` (read by elitea_core's startup check).
+CREDENTIAL_FACTS_VERSION = 2
 KEY_FIELDS = ("agent_binding_ref", "toolkit_instance_id", "credential_ref", "target_ref", "subject_ref")
 
 
@@ -45,11 +47,24 @@ def _key(item) -> tuple:
     return str(_uuid(binding)), str(toolkit), str(_uuid(credential)), str(target), str(subject)
 
 
+def _custodian_user_id(custodian_ref):
+    """The user id in a reference's ``custodian_ref`` JSON, or ``None`` when it names no user."""
+    user_id = custodian_ref.get("user_id") if isinstance(custodian_ref, dict) else None
+    return user_id if isinstance(user_id, int) and not isinstance(user_id, bool) else None
+
+
 def _iso(value):
     return value.isoformat() if value is not None else None
 
 
 class Method:
+    CREDENTIAL_FACTS_VERSION = CREDENTIAL_FACTS_VERSION
+
+    @web.method()
+    def credential_facts_version(self) -> int:
+        """The shape version of ``credential_use_facts`` (a startup check reads it; undecorated attributes do not bind)."""
+        return CREDENTIAL_FACTS_VERSION
+
     @web.method()
     def credential_use_facts(self, project_id: int, config_ids: list, grant_keys: list, ref_ids: list = None) -> dict:
         """Live credential references and grants, for admission and the re-check of a queued run.
@@ -60,9 +75,10 @@ class Method:
         revoked grants are not returned. Returns::
 
             {"references": {configuration_id: {ref_id, state, generation, configuration_generation, store_kind,
-                                               ownership_class, revocation_epoch}},
-             "grants": {"<key joined with |>": {grant_id, state, revocation_epoch, valid_from, valid_until,
-                                                 operations}}}
+                                               ownership_class, revocation_epoch,
+                                               custodian_user_id}},
+             "grants": {"<key joined with |>": {grant_id, state, subject_kind, revocation_epoch, valid_from,
+                                                 valid_until, operations}}}
 
         References are keyed by configuration id whichever selector found them. Times are ISO-8601 strings.
         """
@@ -80,7 +96,8 @@ class Method:
                     references[row.configuration_id] = {
                         "ref_id": str(row.id), "state": row.state, "generation": row.generation,
                         "configuration_generation": row.configuration_generation, "store_kind": row.store_kind,
-                        "ownership_class": row.ownership_class, "revocation_epoch": row.revocation_epoch}
+                        "ownership_class": row.ownership_class, "revocation_epoch": row.revocation_epoch,
+                        "custodian_user_id": _custodian_user_id(row.custodian_ref)}
             if keys:
                 for row in session.execute(select(CredentialUseGrant).where(
                         CredentialUseGrant.project_id == project_id, CredentialUseGrant.state != "revoked",
@@ -93,7 +110,8 @@ class Method:
                              row.target_ref, row.subject_ref)
                     if found in keys:  # the IN lists are a superset of the pairs asked for
                         grants[grant_key_string(found)] = {
-                            "grant_id": str(row.id), "state": row.state, "revocation_epoch": row.revocation_epoch,
-                            "valid_from": _iso(row.valid_from), "valid_until": _iso(row.valid_until),
+                            "grant_id": str(row.id), "state": row.state, "subject_kind": row.subject_kind,
+                            "revocation_epoch": row.revocation_epoch, "valid_from": _iso(row.valid_from),
+                            "valid_until": _iso(row.valid_until),
                             "operations": list(row.operations or [])}
         return {"references": references, "grants": grants}

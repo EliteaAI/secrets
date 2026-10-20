@@ -245,10 +245,11 @@ def test_approving_a_grant_activates_it_in_one_statement(gov, st):
     assert approve(gov, st, grant_id, actor=30, kind="grant") is False
 
 
-def test_only_a_user_delegation_grant_can_be_activated_in_this_slice(gov, st):
-    grant_id = gov.add_grant(state="pending_approval", subject_kind="mandate")
-    assert approve(gov, st, grant_id, kind="grant") is False
-    assert gov.grant(1, grant_id).state == "pending_approval"
+def test_user_delegation_and_mandate_grants_can_both_be_activated(gov, st):
+    for kind in ("user_delegation", "mandate"):
+        grant_id = gov.add_grant(state="pending_approval", subject_kind=kind)
+        assert approve(gov, st, grant_id, kind="grant") is True
+        assert gov.grant(1, grant_id).state == "active"
 
 
 def test_a_grant_cannot_be_resumed_without_an_approval(gov, st):

@@ -2,8 +2,8 @@
 ``manage_credential_grant``.
 
 A grant lets one agent binding use one credential reference, for one toolkit, on behalf of one user
-(``idp:<tenant>:<object>``). It is created pending and becomes active only when someone other than its
-creator approves it. Works with governance off. Every change is an audit event in the same transaction.
+(``idp:<tenant>:<object>``) or of one autonomous mandate (``mandate:<uuid>``). It is created pending and
+becomes active only when someone other than its creator approves it. Works with governance off. Every change is an audit event in the same transaction.
 """
 import re
 import uuid
@@ -23,13 +23,16 @@ from .credential_state import InvalidTransition, approve_grant, transition_grant
 ACTIONS = ("create", "approve", "suspend", "resume", "revoke")
 USAGE = (
     "Format: project_id=N;action=<create|approve|suspend|resume|revoke>;binding_ref=B;toolkit_id=T;ref=R;"
-    "subject_ref=idp:<tenant>:<object>[;valid_until=<ISO-8601 with offset>] (create)"
+    "subject_ref=<idp:<tenant>:<object>|mandate:<uuid>>[;valid_until=<ISO-8601 with offset>] (create)"
     "[;approval_ref=...;policy_revision=...] (approve)[;dry_run]"
 )
 INT_KEYS = ("project_id", "toolkit_id")
 TEXT_KEYS = ("action", "binding_ref", "ref", "subject_ref", "valid_until", "approval_ref", "policy_revision")
 UUID_KEYS = ("binding_ref", "ref")
-SUBJECT_PATTERN = re.compile(r"^idp:[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,64}$")
+_IDP_SUBJECT = r"idp:[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,64}"
+_MANDATE_SUBJECT = r"mandate:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"  # one spelling per id
+SUBJECT_PATTERN = re.compile(rf"^(?:{_IDP_SUBJECT}|{_MANDATE_SUBJECT})$")
+INACTIVE_MANDATE_STATES = ("expired", "revoked")
 ANY_TARGET = "*"
 # Moves that are not approval: action -> (states it starts from, state it ends in)
 MOVES = {
@@ -44,9 +47,17 @@ _VIEWS = MetaData()
 _BINDING = Table(
     "agent_identity_binding", _VIEWS, Column("id", Uuid, primary_key=True), Column("project_id", Integer),
     Column("application_id", Integer), Column("version_id", Integer), schema=c.POSTGRES_TENANT_SCHEMA)
+_MANDATE = Table(
+    "autonomous_mandate", _VIEWS, Column("id", Uuid, primary_key=True), Column("project_id", Integer),
+    Column("agent_binding_ref", Uuid), Column("state", String), schema=c.POSTGRES_TENANT_SCHEMA)
 _TOOL_MAPPING = Table(
     "entity_tool_mapping", _VIEWS, Column("tool_id", Integer, primary_key=True), Column("entity_version_id", Integer),
     Column("entity_type", String), schema=c.POSTGRES_TENANT_SCHEMA)
+
+
+def subject_kind(subject_ref: str) -> str:
+    """``mandate`` for a ``mandate:<uuid>`` subject, else ``user_delegation`` (the subject was validated already)."""
+    return "mandate" if subject_ref.startswith("mandate:") else "user_delegation"
 
 
 def parse_grant_param(param):
@@ -110,11 +121,31 @@ def _find_grant(session, values):
     )).scalar_one_or_none()
 
 
+def _subject_fields(values):
+    subject = values["subject_ref"]
+    if subject_kind(subject) == "mandate":
+        return {"mandate_ref": subject.partition(":")[2]}
+    return {"user_ref": subject}
+
+
+def _check_mandate(session, values, project_id):
+    """A mandate subject must be a live-enough mandate of this project for this very binding."""
+    mandate = session.execute(select(_MANDATE.c.agent_binding_ref, _MANDATE.c.state).where(
+        _MANDATE.c.id == uuid.UUID(values["subject_ref"].partition(":")[2]),
+        _MANDATE.c.project_id == project_id)).first()
+    if mandate is None:
+        raise CredentialTaskError("MANDATE_NOT_FOUND")
+    if mandate.agent_binding_ref != uuid.UUID(values["binding_ref"]):
+        raise CredentialTaskError("MANDATE_BINDING_MISMATCH")
+    if mandate.state in INACTIVE_MANDATE_STATES:
+        raise CredentialTaskError("MANDATE_INACTIVE")
+
+
 def _event(reason_code, values, actor, event_type="lifecycle", **fields):
     return audit.build_event(
         event_type, reason_code, project_id=values["project_id"], actor_user_id=actor,
         credential_ref=values["ref"], agent_binding_ref=values["binding_ref"],
-        toolkit_instance_id=str(values["toolkit_id"]), user_ref=values["subject_ref"], target_ref=ANY_TARGET, **fields)
+        toolkit_instance_id=str(values["toolkit_id"]), target_ref=ANY_TARGET, **_subject_fields(values), **fields)
 
 
 def _create(values, actor):
@@ -135,12 +166,14 @@ def _create(values, actor):
                 _TOOL_MAPPING.c.entity_version_id == binding.version_id, _TOOL_MAPPING.c.entity_type == "agent",
                 _TOOL_MAPPING.c.tool_id == values["toolkit_id"])).first() is None:
             raise CredentialTaskError("TOOLKIT_NOT_IN_BINDING")
+        if subject_kind(values["subject_ref"]) == "mandate":
+            _check_mandate(session, values, project_id)
         if _find_grant(session, values) is not None:
             raise CredentialTaskError("GRANT_EXISTS")
         if values["dry_run"]:
             return {"dry_run": True, "action": "create", "state": "pending_approval"}
         grant = CredentialUseGrant(
-            project_id=project_id, application_id=binding.application_id, subject_kind="user_delegation",
+            project_id=project_id, application_id=binding.application_id, subject_kind=subject_kind(values["subject_ref"]),
             subject_ref=values["subject_ref"], agent_binding_ref=uuid.UUID(values["binding_ref"]),
             toolkit_instance_id=str(values["toolkit_id"]), credential_ref=uuid.UUID(values["ref"]),
             target_ref=ANY_TARGET, valid_until=values.get("valid_until"), state="pending_approval",

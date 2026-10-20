@@ -46,6 +46,9 @@ BINDING = sa.Table("agent_identity_binding", TEST_TABLES, sa.Column("id", sa.Uui
 TOOL_MAPPING = sa.Table("entity_tool_mapping", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
                         sa.Column("tool_id", sa.Integer), sa.Column("entity_version_id", sa.Integer),
                         sa.Column("entity_type", sa.String), schema=SCHEMA)
+MANDATE = sa.Table("autonomous_mandate", TEST_TABLES, sa.Column("id", sa.Uuid, primary_key=True),
+                   sa.Column("project_id", sa.Integer), sa.Column("agent_binding_ref", sa.Uuid),
+                   sa.Column("state", sa.String), schema=SCHEMA)
 AUDIT_OUTBOX = sa.Table("audit_outbox", TEST_TABLES, sa.Column("event_id", sa.String, primary_key=True),
                         sa.Column("body", sa.Text), schema=SCHEMA)
 
