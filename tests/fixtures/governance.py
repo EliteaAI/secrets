@@ -334,7 +334,9 @@ class FakeTracing:
 # --- configurations ---------------------------------------------------------------------------------------------------
 
 class FakeConfigurations:
-    """The two in-process methods, over an in-memory table. ``bundle`` is as strict about the context as the real one."""
+    """The in-process methods, over an in-memory table. ``bundle`` is as strict about the context as the real one."""
+
+    instances = 0
 
     def __init__(self, stores, databases=None):
         self.stores = stores
@@ -344,6 +346,11 @@ class FakeConfigurations:
         self.bundle_error = None
         self.secret_paths = {"api_cred": ["api_key"]}  # type -> secret field paths (``headers.*`` = a map of passwords)
         self.secret_fields_error = None
+        FakeConfigurations.instances += 1
+        # a registry version no other fake instance used, so the plugin's in-process cache never answers for a test
+        # other than the one that filled it
+        self.registry_version = FakeConfigurations.instances * 1_000_000
+        self.secret_fields_calls = []  # the types asked of ``configuration_secret_fields``, one list per call
 
     def add(self, project_id, *, type_="api_cred", section="credentials", secrets=None, generation=1, title=None):
         rows = self.rows.setdefault(project_id, {})
@@ -379,8 +386,13 @@ class FakeConfigurations:
                            "generation": row.generation, "title": row.title}
                 for row in self.rows.get(project_id, {}).values() if row.uuid in uuids}
 
+    def configuration_registry_version(self):
+        """The shape of the real method: a number that changes whenever a configuration type is (un)registered."""
+        return self.registry_version
+
     def configuration_secret_fields(self, types):
         """The shape of the real method: ``{type: [path, ...]}``, an unregistered type left out."""
+        self.secret_fields_calls.append(list(types))
         if self.secret_fields_error:
             raise self.secret_fields_error
         return {name: list(self.secret_paths[name]) for name in types if name in self.secret_paths}

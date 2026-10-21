@@ -1299,3 +1299,40 @@ def test_the_administration_list_is_unchanged_and_still_shows_everything(w):
     w.personal(OTHER_OWNER)
     body, status = w.call("credential_references", "get", PROJECT)
     assert status == 200 and body["total"] == 2 and "written_by" in body["rows"][0]
+
+
+# --- the secret-field-path cache (perf review 2026-10-21, S2) ---------------------------------------------------------
+
+def test_the_secret_fields_of_a_type_are_asked_once_until_the_registry_changes(w):
+    configurations = w.gov.configurations
+    ref = w.personal()
+    assert w.put(ref, {"api_key": SECRET})[1] == 200
+    assert w.put(ref, {"api_key": SECRET_2}, expected_generation=1)[1] == 200
+    assert w.put(ref, {"api_key": SECRET}, expected_generation=2)[1] == 200
+    assert configurations.secret_fields_calls == [["api_cred"]]
+    configurations.registry_version += 1
+    configurations.secret_paths["api_cred"] = ["api_key", "token"]
+    assert w.put(ref, {"token": SECRET}, expected_generation=3)[1] == 200   # the changed schema is seen at once
+    assert configurations.secret_fields_calls == [["api_cred"], ["api_cred"]]
+
+
+def test_an_unknown_type_and_a_failing_service_are_not_remembered(w):
+    configurations = w.gov.configurations
+    ref = w.personal()
+    configurations.secret_paths.clear()
+    assert w.put(ref)[1] == 400 and w.put(ref)[1] == 400
+    configurations.secret_paths["api_cred"] = ["api_key"]
+    assert w.put(ref)[1] == 200                                             # the type is known now, same version
+    configurations.registry_version += 1
+    configurations.secret_fields_error = RuntimeError("down")
+    assert w.put(ref, expected_generation=1)[1] == 503
+    configurations.secret_fields_error = None
+    assert w.put(ref, expected_generation=1)[1] == 200
+
+
+def test_without_a_registry_version_the_paths_are_asked_every_time(w, monkeypatch):
+    configurations = w.gov.configurations
+    monkeypatch.setattr(type(configurations), "configuration_registry_version", None)   # an older configurations plugin
+    ref = w.personal()
+    assert w.put(ref)[1] == 200 and w.put(ref, expected_generation=1)[1] == 200
+    assert configurations.secret_fields_calls == [["api_cred"], ["api_cred"]]
