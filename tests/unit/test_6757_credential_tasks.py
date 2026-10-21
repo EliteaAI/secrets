@@ -261,7 +261,7 @@ def test_init_loads_the_methods_and_registers_the_credential_permissions(plugin)
     permissions = {entry["permissions"][0]: entry["recommended_roles"] for entry in plugin.registered
                    if entry["permissions"][0].startswith("credentials.")}
     assert sorted(permissions) == ["credentials.approve", "credentials.manage", "credentials.probe",
-                                   "credentials.reveal", "credentials.use", "credentials.view"]
+                                   "credentials.reveal", "credentials.set_own_value", "credentials.use", "credentials.view"]
     assert permissions["credentials.use"]["default"] == {"admin": True, "viewer": True, "editor": True}
     for name in ("credentials.manage", "credentials.probe", "credentials.approve"):
         # what the role model grants after its defaults: operators only, never the system role

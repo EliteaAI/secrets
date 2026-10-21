@@ -36,6 +36,8 @@ from .credential_onboarding import (
 from ..models.credential_governance import GRANT_STATES, OWNERSHIP_CLASSES, REFERENCE_STATES, STORE_KINDS
 
 VIEW, MANAGE, PROBE, APPROVE = "credentials.view", "credentials.manage", "credentials.probe", "credentials.approve"
+# The owner of a personal reference sets its value (no one else, administrators included) and sees their own references
+SET_OWN_VALUE = "credentials.set_own_value"
 # ``system`` is named everywhere: the role model defaults it to true, and these permissions are for operators only
 _OPERATORS = {"system": False, "super_admin": True, "admin": True, "viewer": False, "editor": False}
 # Read access exists in administration mode only; the project (default) mode has no handler in slice 1
@@ -47,6 +49,11 @@ VIEW_ROLES = {
 OPERATE_ROLES = {
     "administration": dict(_OPERATORS),
     "default": {"system": False, "admin": True, "viewer": False, "editor": False},
+}
+# Every project member can hold it in default mode; in administration mode only administrators (who may be owners too)
+OWN_VALUE_ROLES = {
+    "administration": {"system": False, "super_admin": True, "admin": True, "viewer": False, "editor": False},
+    "default": {"system": False, "admin": True, "viewer": True, "editor": True},
 }
 REFERENCE_ACTION_PERMISSION = {
     "import": MANAGE, "activate": MANAGE, "suspend": MANAGE, "resume": MANAGE, "retire": MANAGE,
@@ -65,7 +72,7 @@ SORT_ORDERS = ("asc", "desc")
 STATUS = {
     400: ("INVALID_REQUEST", "APPROVAL_REQUIRED", "CONFIGURATION_NOT_ELIGIBLE", "UNSUPPORTED_STORE_KIND",
           "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER"),
-    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC"),
+    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC", "OWNER_ONLY"),
     404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
@@ -478,11 +485,46 @@ def reference_action(project_id, ref_id):
     return result_reply(run_reference_action(values, actor_id(), audit_code=True))
 
 
-def put_material(project_id, ref_id):
-    """Write the value of a personal reference. Write-only: the reply holds the new generation and state, never the value."""
+def authorize_value_write(project_id, ref_id, administration):
+    """Who may write this reference's value, decided before the body is read. A personal value is set by its owner and
+    by no one else, administrators included (``OWNER_ONLY``); the endpoint is open to ``credentials.manage`` or
+    ``credentials.set_own_value``, so for any other reference (which takes no value, but is not for the others to
+    probe) ``credentials.manage`` is asked here, and the default-mode route refuses outright."""
+    actor = actor_id()
+    if actor == 0:
+        raise CredentialTaskError("ACTOR_REQUIRED")
+    ownership_class, owner = queries.reference_custody(project_id, ref_id)
+    if ownership_class == "personal":
+        if owner != actor:
+            raise CredentialTaskError("OWNER_ONLY")
+    elif administration:
+        require_permission(MANAGE, project_id)
+    else:
+        raise CredentialTaskError("FORBIDDEN")
+
+
+def put_material(project_id, ref_id, administration=True):
+    """Write the value of a reference (a personal one: by its owner). Write-only: the reply holds the new generation and
+    state, never the value."""
+    authorize_value_write(project_id, ref_id, administration)
     body = parse_body(MaterialBody, read_json_object(MAX_MATERIAL_BODY_BYTES))
     result = write_material(project_id, str(ref_id), body.fields, body.expected_generation, actor_id())
     return result_reply(result)
+
+
+# What the owner of a personal reference sees of it: no operators' names or approval details
+_OWN_REFERENCE_KEYS = ("id", "configuration", "provider", "ownership_class", "owner", "store_kind", "state", "generation",
+                       "validated", "configuration_changed", "expires_at", "created_at", "updated_at")
+
+
+def list_own_references(project_id):
+    """The caller's own personal references of the project (``?mine=true``), metadata only."""
+    args = request.args
+    if args.get("mine") != "true" or actor_id() == 0:
+        raise CredentialTaskError("INVALID_REQUEST")
+    filters = {**reference_filters(args), "ownership_class": "personal", "owner_user_id": actor_id()}
+    found = queries.list_references(project_id, parse_page(args, queries.REFERENCE_SORTS), filters)
+    return {"total": found["total"], "rows": [{key: row[key] for key in _OWN_REFERENCE_KEYS} for row in found["rows"]]}, 200
 
 
 def list_grants(project_id):

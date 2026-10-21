@@ -38,6 +38,7 @@ MESSAGES = {
     "CHECK_CONNECTION_FAILED": "The provider did not accept the stored credential.",
     "CHECK_CONNECTION_REFUSED": "The connection check could not be run for this credential.",
     "DENIED_RBAC": "You do not have permission to test saved credentials.",
+    "OWNER_ONLY": "Only the owner of a personal credential can set its value.",
     # REST API only (#7119)
     "INVALID_REQUEST": "The request is not valid.",
     "REQUEST_TOO_LARGE": "The request is too large.",

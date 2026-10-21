@@ -47,7 +47,7 @@ class World:
         self.schema = gov.module("utils.credential_schema")
         self.users = {WRITER: user(WRITER, "o60"), CREATOR: user(CREATOR, "o10"), APPROVER: user(APPROVER, "o20"), OWNER: user(OWNER, "o30"),
                       OTHER_OWNER: user(OTHER_OWNER, "o31"), UNLINKED: user(UNLINKED, None), OUTSIDER: user(OUTSIDER, "o50")}
-        self.members = [CREATOR, APPROVER, OWNER, OTHER_OWNER, UNLINKED]
+        self.members = [CREATOR, APPROVER, OWNER, OTHER_OWNER, UNLINKED, WRITER]
         self.permissions = {"credentials.view", "credentials.manage", "credentials.probe", "credentials.approve"}
         self.identity_down = False
         self.actor = CREATOR
@@ -68,7 +68,9 @@ class World:
                 has_access=lambda current, required: bool(set(required) & set(current))).items():
             self.monkeypatch.setattr(StubAuth, name, staticmethod(func), raising=False)
 
-    def call(self, name, verb, *path, body=None, raw=None, actor=None, content_type=None, **kwargs):
+    def call(self, name, verb, *path, body=None, raw=None, actor=None, content_type=None, handler="AdminAPI", **kwargs):
+        if actor is None and name == "credential_material":   # the writer of a value is its owner unless a test says otherwise
+            actor = self.owner_of(path[1])
         self.monkeypatch.setattr(StubAuth, "user", {"id": self.actor if actor is None else actor} if (actor != 0) else {})
         request = {"method": verb.upper(), **kwargs}
         if raw is not None:
@@ -79,7 +81,8 @@ class World:
             call=types.SimpleNamespace(project_get_by_id=lambda project_id: {"id": project_id}))))
         with app.test_request_context(**request):
             g.auth = types.SimpleNamespace(type="user", id=CREATOR)
-            handler = self.mods[name].AdminAPI(api=types.SimpleNamespace(module=module), mode="administration")
+            mode = "administration" if handler == "AdminAPI" else "default"
+            handler = getattr(self.mods[name], handler)(api=types.SimpleNamespace(module=module), mode=mode)
             return getattr(handler, verb)(*path)
 
     # -- references
@@ -102,6 +105,14 @@ class World:
         return self.call("credential_reference_action", "post", project, uuid.UUID(str(ref)),
                          body={"action": action, **fields}, actor=actor)
 
+    def owner_of(self, ref):
+        """Whoever may write this reference's value: its owner, for a personal one (an operator otherwise)."""
+        try:
+            custodian = self.row(ref).custodian_ref
+        except (AttributeError, KeyError, ValueError):   # no such reference
+            custodian = None
+        return custodian["user_id"] if custodian else CREATOR
+
     def put(self, ref, fields=None, expected_generation=0, project=PROJECT, actor=None, **kw):
         body = {"fields": {"api_key": SECRET} if fields is None else fields, "expected_generation": expected_generation}
         return self.call("credential_material", "put", project, uuid.UUID(str(ref)), body=body, actor=actor, **kw)
@@ -114,6 +125,9 @@ class World:
                      if step == "approve" else self.action(ref, step, actor=APPROVER if step == "activate" else None))
             assert reply[1] == 200, reply
         return ref
+
+    def config_reads(self):
+        return len(self.gov.configurations.bundle_calls)
 
     def row(self, ref, project=PROJECT):
         return self.gov.reference(project, uuid.UUID(str(ref)))
@@ -360,7 +374,7 @@ def test_writing_the_value_stages_commits_and_answers_without_it(w):
     events = {event["reason_code"]: event for event in w.events()}
     started, written = events["CREDENTIAL_MATERIAL_WRITE_STARTED"], events["CREDENTIAL_MATERIAL_WRITTEN"]
     assert (started["credential_generation"], written["credential_generation"], written["outcome"]) == (1, 1, "success")
-    assert started["user_ref"] == written["user_ref"] == OWNER_SUBJECT and written["caller_ref"] == f"operator:{CREATOR}"
+    assert started["user_ref"] == written["user_ref"] == OWNER_SUBJECT and written["caller_ref"] == f"operator:{OWNER}"   # the owner wrote it
     assert w.store().calls == [("write", "onboard", started["event_id"])]
 
 
@@ -595,13 +609,13 @@ def test_the_endpoint_is_write_only(w):
     with pytest.raises(AttributeError):
         w.call("credential_material", "get", PROJECT, uuid.UUID(ref))
     api = w.mods["credential_material"].API
-    assert api.url_params == ["<int:project_id>/<uuid:ref_id>"] and list(api.mode_handlers) == ["administration"]
+    assert api.url_params == ["<int:project_id>/<uuid:ref_id>"] and set(api.mode_handlers) == {"administration", "default"}
 
 
 def test_the_value_write_needs_manage_and_a_signed_in_operator(w):
     descriptor = StubAuth.decorators.requirements[
         f"{w.mods['credential_material'].__name__}:AdminAPI.put"]
-    assert descriptor["permissions"] == ["credentials.manage"]
+    assert descriptor["permissions"] == ["credentials.manage", "credentials.set_own_value"]
     api = w.gov.module("utils.credential_api")
     assert descriptor["recommended_roles"] == api.OPERATE_ROLES
     ref = w.personal()
@@ -1017,8 +1031,8 @@ def test_a_busy_table_fails_that_project_alone_after_the_lock_timeout(w, monkeyp
 # --- review fixes: who writes, who approves, rotation -----------------------------------------------------------------
 
 def test_whoever_wrote_the_value_cannot_approve_it(w):
-    ref = w.personal()
-    assert w.put(ref, actor=WRITER)[1] == 200
+    ref = w.personal(WRITER)   # the owner writes the value of their own credential
+    assert w.put(ref)[1] == 200
     assert w.row(ref).written_by == WRITER and w.row(ref).created_by == CREATOR
     assert w.action(ref, "probe", actor=APPROVER)[1] == 200
     body, status = w.action(ref, "approve", actor=WRITER, approval_ref="CHG-1", policy_revision="rev-1")
@@ -1028,11 +1042,7 @@ def test_whoever_wrote_the_value_cannot_approve_it(w):
     assert w.action(ref, "approve", actor=APPROVER, approval_ref="CHG-1", policy_revision="rev-1")[1] == 200
 
 
-def test_a_new_value_replaces_the_writer_and_an_import_records_one_too(w):
-    ref = w.personal()
-    w.put(ref, actor=WRITER)
-    w.put(ref, {"api_key": SECRET_2}, expected_generation=1, actor=APPROVER)
-    assert w.row(ref).written_by == APPROVER
+def test_an_import_records_its_writer_too(w):
     shared = w.create(None, ownership_class="service")[0]["id"]
     assert w.action(shared, "import", actor=WRITER)[1] == 200 and w.row(shared).written_by == WRITER
     w.action(shared, "probe")
@@ -1041,8 +1051,8 @@ def test_a_new_value_replaces_the_writer_and_an_import_records_one_too(w):
 
 
 def test_the_lists_name_the_writer(w):
-    ref = w.personal()
-    w.put(ref, actor=WRITER)
+    ref = w.personal(WRITER)
+    w.put(ref)
     [row] = w.call("credential_references", "get", PROJECT)[0]["rows"]
     assert row["written_by"] == {"id": WRITER, "email": f"u{WRITER}@x.test"}
 
@@ -1055,14 +1065,14 @@ def test_a_suspended_reference_takes_a_new_value_and_keeps_its_grants(w):
         "agent_binding_ref": binding, "toolkit_id": TOOLKIT, "credential_ref": ref, "subject_user_id": OWNER})[0]["id"]
     assert w.put(ref, {"api_key": SECRET_2}, expected_generation=1)[0]["code"] == "INVALID_STATE"   # not while it is in use
     assert w.action(ref, "suspend")[1] == 200
-    body, status = w.put(ref, {"api_key": SECRET_2}, expected_generation=1, actor=WRITER)
+    body, status = w.put(ref, {"api_key": SECRET_2}, expected_generation=1)
     assert (status, body) == (200, {"ok": True, "generation": 2, "state": "pending"})
     for step, who in (("probe", CREATOR),):
         assert w.action(ref, step, actor=who)[1] == 200
     assert w.action(ref, "approve", actor=APPROVER, approval_ref="CHG-2", policy_revision="rev-2")[1] == 200
     assert w.action(ref, "activate", actor=APPROVER)[0]["state"] == "active"
     row = w.row(ref)
-    assert (row.generation, row.validated_generation, row.written_by) == (2, 2, WRITER)
+    assert (row.generation, row.validated_generation, row.written_by) == (2, 2, OWNER)
     assert w.gov.grant(PROJECT, uuid.UUID(grant)).credential_ref == uuid.UUID(ref)
     assert w.store().versions[uuid.UUID(ref)] == {1: {"api_key": SECRET}, 2: {"api_key": SECRET_2}}
 
@@ -1117,3 +1127,175 @@ def test_the_release_serves_a_pending_value_only_to_the_onboarding_probe(w):
         == "CREDENTIAL_GENERATION_MISMATCH"
     w.action(ref, "retire")
     assert release.release_material(*args, allow_pending=True)["reason_code"] == "CREDENTIAL_REFERENCE_INACTIVE"
+
+
+# --- a personal value is set by its owner only ---------------------------------------------------------------------------
+
+MODES = ("AdminAPI", "ProjectAPI")
+
+
+@pytest.mark.parametrize("handler", MODES)
+def test_the_owner_writes_their_value_in_either_mode(w, handler):
+    ref = w.personal()
+    body, status = w.put(ref, actor=OWNER, handler=handler)
+    assert (status, body) == (200, {"ok": True, "generation": 1, "state": "pending"})
+    assert w.row(ref).written_by == OWNER and w.store().versions[uuid.UUID(ref)] == {1: {"api_key": SECRET}}
+
+
+@pytest.mark.parametrize("handler", MODES)
+@pytest.mark.parametrize("actor, label", [
+    (CREATOR, "an administrator (who created it)"), (APPROVER, "another administrator"),
+    (OTHER_OWNER, "another project member"), (OUTSIDER, "someone outside the project"),
+])
+def test_no_one_but_the_owner_can_type_a_personal_value(w, handler, actor, label):
+    ref = w.personal()
+    body, status = w.put(ref, actor=actor, handler=handler)
+    assert (status, body) == (403, {"error": "Only the owner of a personal credential can set its value.",
+                                    "code": "OWNER_ONLY"}), label
+    assert w.row(ref).generation == 0 and w.row(ref).pending_generation is None
+    assert w.store().calls == [] and w.gov.ledger(PROJECT) == [] and w.config_reads() == 0
+
+
+@pytest.mark.parametrize("handler", MODES)
+def test_a_personal_value_is_refused_before_the_body_is_read(w, handler):
+    ref = w.personal()
+    body, status = w.call("credential_material", "put", PROJECT, uuid.UUID(ref), raw="{not json", actor=APPROVER,
+                          handler=handler)
+    assert (status, body["code"]) == (403, "OWNER_ONLY")   # not a 400 for the body, and nothing parsed
+
+
+@pytest.mark.parametrize("handler", MODES)
+def test_a_reference_of_another_project_is_not_found_for_everyone(w, handler):
+    ref = w.personal()
+    for actor in (OWNER, CREATOR, OTHER_OWNER):
+        assert w.put(ref, actor=actor, project=OTHER_PROJECT, handler=handler)[1] == 404
+    assert w.put(uuid.uuid4(), actor=OWNER, handler=handler)[1] == 404
+
+
+@pytest.mark.parametrize("handler", MODES)
+def test_an_unidentified_caller_is_refused(w, handler):
+    ref = w.personal()
+    body, status = w.put(ref, actor=0, handler=handler)
+    assert (status, body["code"]) == (403, "ACTOR_REQUIRED")
+
+
+def test_a_shared_reference_is_still_for_credentials_manage_in_the_administration_route(w):
+    shared = w.create(None, ownership_class="service")[0]["id"]
+    body, status = w.put(shared, actor=CREATOR)
+    assert (status, body["code"]) == (409, "PERSONAL_ONLY")                      # as before: it takes no value
+    w.permissions = {"credentials.set_own_value"}                                # the owner's permission is not manage
+    assert w.put(shared, actor=OWNER)[0]["code"] == "FORBIDDEN"
+    assert w.put(shared, actor=OWNER)[1] == 403
+    w.permissions = {"credentials.manage"}
+    assert w.put(shared, actor=CREATOR)[0]["code"] == "PERSONAL_ONLY"
+
+
+def test_a_shared_reference_takes_nothing_through_the_default_mode_route(w):
+    shared = w.create(None, ownership_class="service")[0]["id"]
+    for actor in (OWNER, CREATOR):
+        body, status = w.put(shared, actor=actor, handler="ProjectAPI")
+        assert (status, body["code"]) == (403, "FORBIDDEN")
+    assert w.store().calls == []
+
+
+def test_an_administrator_who_is_the_owner_may_write_their_own_value(w):
+    ref = w.personal(CREATOR)
+    assert w.put(ref, actor=CREATOR)[1] == 200
+    assert w.put(ref, {"api_key": SECRET_2}, expected_generation=1, actor=CREATOR, handler="ProjectAPI")[1] == 200
+
+
+def test_the_owner_needs_neither_manage_nor_any_operator_permission(w):
+    ref = w.personal()
+    w.permissions = {"credentials.set_own_value"}
+    assert w.put(ref, actor=OWNER)[1] == 200
+    assert w.put(ref, {"api_key": SECRET_2}, expected_generation=1, actor=OWNER, handler="ProjectAPI")[1] == 200
+
+
+def test_the_routes_declare_the_permissions_and_the_modes(w):
+    api = w.gov.module("utils.credential_api")
+    material = w.mods["credential_material"]
+    admin = StubAuth.decorators.requirements[f"{material.__name__}:AdminAPI.put"]
+    project = StubAuth.decorators.requirements[f"{material.__name__}:ProjectAPI.put"]
+    assert admin["permissions"] == [api.MANAGE, api.SET_OWN_VALUE] and project["permissions"] == [api.SET_OWN_VALUE]
+    assert project["recommended_roles"] == api.OWN_VALUE_ROLES
+    assert set(material.API.mode_handlers) == {"default", "administration"}
+    assert material.API.url_params == ["<int:project_id>/<uuid:ref_id>"]
+    mine = StubAuth.decorators.requirements[f"{w.mods['credential_references'].__name__}:ProjectAPI.get"]
+    assert mine["permissions"] == [api.SET_OWN_VALUE]
+    assert set(w.mods["credential_references"].API.mode_handlers) == {"default", "administration"}
+    for handler in (material.ProjectAPI,):   # write-only in this mode too
+        assert [verb for verb in ("get", "post", "delete", "patch") if hasattr(handler, verb)] == []
+
+
+def test_the_own_value_permission_is_recommended_to_every_member_in_default_mode_and_to_admins_otherwise(gov, monkeypatch):
+    from unittest.mock import MagicMock  # pylint: disable=C0415
+    from fixtures.permissions import effective_roles  # pylint: disable=C0415
+    registered = []
+    monkeypatch.setattr(StubAuth, "register_permissions", staticmethod(registered.append), raising=False)
+    descriptor_ = MagicMock()
+    descriptor_.metadata = {}
+    gov.module("module").Module(context=MagicMock(), descriptor=descriptor_).init()
+    roles = {e["permissions"][0]: effective_roles(e["recommended_roles"]) for e in registered}["credentials.set_own_value"]
+    assert roles["default"] == {**roles["default"], "admin": True, "editor": True, "viewer": True, "system": False}
+    assert roles["administration"]["admin"] is True and roles["administration"]["editor"] is False
+    assert roles["administration"]["viewer"] is False and roles["administration"]["system"] is False
+
+
+# --- the owner's own list ------------------------------------------------------------------------------------------------------
+
+def mine(w, actor, project=PROJECT, **query):
+    return w.call("credential_references", "get", project, actor=actor, handler="ProjectAPI", query_string=query)
+
+
+def test_the_owner_sees_only_their_own_personal_references(w):
+    config = w.gov.configurations.add(PROJECT)
+    mine_ref = w.personal(OWNER, config=config)
+    w.personal(OTHER_OWNER, config=config)
+    w.create(None, config, ownership_class="service")
+    w.personal(OWNER)
+    body, status = mine(w, OWNER, mine="true")
+    assert status == 200 and body["total"] == 2 and mine_ref in {row["id"] for row in body["rows"]}
+    assert all(row["ownership_class"] == "personal" and row["owner"]["id"] == OWNER for row in body["rows"])
+    other, _ = mine(w, OTHER_OWNER, mine="true")
+    assert other["total"] == 1 and other["rows"][0]["owner"]["id"] == OTHER_OWNER
+    nobody, _ = mine(w, APPROVER, mine="true")
+    assert nobody == {"total": 0, "rows": []}
+
+
+def test_the_owners_list_is_metadata_without_operators_or_approvals(w):
+    ref = w.personal()
+    w.lifecycle(ref)
+    [row] = mine(w, OWNER, mine="true")[0]["rows"]
+    assert set(row) == {"id", "configuration", "provider", "ownership_class", "owner", "store_kind", "state", "generation",
+                        "validated", "configuration_changed", "expires_at", "created_at", "updated_at"}
+    assert row["state"] == "active"
+    text = json.dumps(row)
+    for hidden in ("u10@x.test", "u20@x.test", "approval", "policy", "written_by", OWNER_SUBJECT, "store_locator", SECRET):
+        assert hidden not in text
+
+
+@pytest.mark.parametrize("query", [{}, {"mine": "false"}, {"mine": "1"}, {"mine": "TRUE"}])
+def test_the_owners_list_needs_mine_true(w, query):
+    w.personal()
+    body, status = mine(w, OWNER, **query)
+    assert (status, body["code"]) == (400, "INVALID_REQUEST")
+
+
+def test_the_owners_list_cannot_be_widened_by_the_filters_it_shares_with_the_operator_list(w):
+    w.personal(OTHER_OWNER)
+    body, _ = mine(w, OWNER, mine="true", owner_user_id=str(OTHER_OWNER), ownership_class="service")
+    assert body == {"total": 0, "rows": []}
+    assert mine(w, OWNER, mine="true", owner_user_id="x")[1] == 400   # still a validated filter
+
+
+def test_the_owners_list_is_per_project_and_needs_a_signed_in_user(w):
+    w.personal()
+    assert mine(w, OWNER, project=OTHER_PROJECT, mine="true")[0] == {"total": 0, "rows": []}
+    assert mine(w, 0, mine="true")[1] == 400
+
+
+def test_the_administration_list_is_unchanged_and_still_shows_everything(w):
+    w.personal(OWNER)
+    w.personal(OTHER_OWNER)
+    body, status = w.call("credential_references", "get", PROJECT)
+    assert status == 200 and body["total"] == 2 and "written_by" in body["rows"][0]

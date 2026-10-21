@@ -639,7 +639,9 @@ def test_every_endpoint_declares_its_permissions_and_the_operator_roles(rest, mo
     if permissions == ["credentials.view"]:
         assert not any(effective["default"].values())  # the project mode does not see these endpoints at all
     handler = rest.mods[module]
-    assert list(handler.API.mode_handlers) == ["administration"] and handler.API.mode_handlers["administration"] is handler.AdminAPI
+    assert handler.API.mode_handlers["administration"] is handler.AdminAPI
+    # only the owner's own list has a default-mode handler here (#7119 PR 6); the rest is for operators
+    assert set(handler.API.mode_handlers) == ({"administration", "default"} if module == "credential_references" else {"administration"})
 
 
 def test_the_route_shapes_match_the_design(rest):

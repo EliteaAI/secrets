@@ -219,6 +219,17 @@ def list_references(project_id, page, filters):
     return {"total": total, "rows": _present_references(project_id, rows)}
 
 
+def reference_custody(project_id, ref_id):
+    """``(ownership_class, owner user id or None)`` of one reference of the project; a reference of another project is
+    ``REFERENCE_NOT_FOUND`` like an unknown one."""
+    with project_tx(project_id) as session:
+        row = session.execute(select(_REF.ownership_class, _REF.custodian_ref).where(
+            _REF.id == uuid.UUID(str(ref_id)), _REF.project_id == project_id)).first()
+    if row is None:
+        raise CredentialTaskError("REFERENCE_NOT_FOUND")
+    return row.ownership_class, _owner_id(row.custodian_ref)
+
+
 def reference_detail(project_id, ref_id):
     """One reference of the project with the number of live grants on it and whether a store write is in flight."""
     ref_uuid = uuid.UUID(str(ref_id))

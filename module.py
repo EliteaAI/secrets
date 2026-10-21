@@ -86,6 +86,7 @@ class Module(module.ModuleModel):
                 (credential_api.MANAGE, credential_api.OPERATE_ROLES),
                 (credential_api.PROBE, credential_api.OPERATE_ROLES),
                 (credential_api.APPROVE, credential_api.OPERATE_ROLES),
+                (credential_api.SET_OWN_VALUE, credential_api.OWN_VALUE_ROLES),
                 ("credentials.use", {
                     "administration": {"admin": True, "viewer": False, "editor": False},
                     "default": {"admin": True, "viewer": True, "editor": True}}),
