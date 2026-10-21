@@ -8,9 +8,12 @@ class Method:
     @web.method()
     def release_credential_material(  # pylint: disable=R0913
         self, project_id: int, ref_id: str, generation: int, release_id: str, actor_ref: str,
-        *, allow_validated: bool = False, allow_pending: bool = False,
+        allow_validated: bool = False, allow_pending: bool = False,
     ) -> dict:
         """The material of one credential reference at one generation, for a run or a probe that was admitted.
+
+        ``allow_validated`` stays positional-or-keyword: the admission layer deployed with the integration branch
+        passes it positionally, and this method must keep working while the two plugins roll out separately.
 
         Called in-process by the admission layer after it decided and before it audited the release; it does not
         decide. ``release_id`` becomes the store ``decision_id`` (the Vault ``X-Correlation-Id``), ``actor_ref``

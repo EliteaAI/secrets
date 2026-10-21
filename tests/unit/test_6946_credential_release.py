@@ -434,15 +434,18 @@ def test_with_the_real_port_each_reference_has_its_own_release_context(gov, batc
     assert [call[1] for call in store.calls] == ["release", "release"]
 
 
-def test_both_release_methods_take_their_flags_by_keyword_in_the_same_order(gov):
+def test_release_flags_keep_the_deployed_single_call_working_and_the_batch_keyword_only(gov):
+    """The admission layer on the integration branch calls the single method with ``allow_validated`` positional;
+    the secrets plugin may roll out before it, so that call must keep working. The batch method is new and takes
+    its flags by keyword only, in the same order."""
     import inspect  # pylint: disable=C0415
     method = gov.module("methods.credential_release").Method
-    flags = {}
-    for name in ("release_credential_material", "release_credential_materials"):
-        parameters = list(inspect.signature(getattr(method, name)).parameters.values())
-        flags[name] = [p.name for p in parameters if p.kind is p.KEYWORD_ONLY]
-        assert all(p.kind is p.POSITIONAL_OR_KEYWORD for p in parameters if p.name in ("project_id", "release_id", "actor_ref"))
-    assert flags["release_credential_material"] == flags["release_credential_materials"] == ["allow_validated", "allow_pending"]
+    single = list(inspect.signature(method.release_credential_material).parameters.values())
+    assert [p.name for p in single if p.name.startswith("allow_")] == ["allow_validated", "allow_pending"]
+    assert all(p.kind is p.POSITIONAL_OR_KEYWORD for p in single if p.name.startswith("allow_"))
+    batch = list(inspect.signature(method.release_credential_materials).parameters.values())
+    assert [p.name for p in batch if p.kind is p.KEYWORD_ONLY] == ["allow_validated", "allow_pending"]
+    assert all(p.kind is p.POSITIONAL_OR_KEYWORD for p in batch if p.name in ("project_id", "release_id", "actor_ref"))
     ref = active(gov)
     with pytest.raises(TypeError):
         method.release_credential_materials(object(), PROJECT, [{"ref_id": str(ref), "generation": 2}], RELEASE_ID, ACTOR, True)
