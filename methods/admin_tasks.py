@@ -24,6 +24,10 @@ class Method:
         (``MIGRATION_REQUIRED``). Each project waits at most 5 s for its table; one that is busy fails alone and the
         step is repeated. It is reported under ``personal_index`` (``migrated`` = would swap, on a dry run).
 
+        Third step, ``grant_subject_user_id``: adds ``credential_use_grant.subject_user_id`` where it is missing (the
+        startup guard adds it too), so a grants list names a subject from the grant itself. Additive and idempotent;
+        reported under ``grant_subject_user_id`` (``migrated`` = would add, on a dry run).
+
         Param format (required):
             "project_id=<all|N>[;dry_run]"
 
@@ -33,7 +37,8 @@ class Method:
             "project_id=3"            - project 3 only
         """
         from ..utils.credential_schema import (  # pylint: disable=C0415
-            apply_credential_tables, apply_personal_index, parse_project_param, project_ids_missing_credential_tables,
+            apply_credential_tables, apply_grant_subject_user_id, apply_personal_index, parse_project_param,
+            project_ids_missing_credential_tables, project_ids_missing_grant_subject_user_id,
             project_ids_missing_personal_index, target_project_ids,
         )
 
@@ -55,13 +60,27 @@ class Method:
             return {"migrated": len(migrated), "failed": len(failed), "failed_projects": failed, "dry_run": dry_run,
                     "error": "failed to read the indexes"}
         index_migrated, index_failed = apply_personal_index(pending, dry_run=dry_run)
+        try:   # a project that just got its tables has the column already
+            lacking = set(project_ids_missing_grant_subject_user_id())
+        except Exception:  # pylint: disable=W0703
+            log.exception("create_credential_governance_tables: failed to read the grant columns")
+            return {"migrated": len(migrated), "failed": len(failed), "failed_projects": failed, "dry_run": dry_run,
+                    "personal_index": {"migrated": len(index_migrated), "failed": len(index_failed),
+                                       "failed_projects": index_failed},
+                    "error": "failed to read the grant columns"}
+        column_migrated, column_failed = apply_grant_subject_user_id(
+            [pid for pid in project_ids if pid in lacking], dry_run=dry_run)
         log.info(
-            "%screate_credential_governance_tables: migrated=%s failed=%s personal_index migrated=%s failed=%s",
+            "%screate_credential_governance_tables: migrated=%s failed=%s personal_index migrated=%s failed=%s "
+            "grant_subject_user_id migrated=%s failed=%s",
             "[DRY RUN] " if dry_run else "", len(migrated), len(failed), len(index_migrated), len(index_failed),
+            len(column_migrated), len(column_failed),
         )
         return {"migrated": len(migrated), "failed": len(failed), "failed_projects": failed, "dry_run": dry_run,
                 "personal_index": {"migrated": len(index_migrated), "failed": len(index_failed),
-                                   "failed_projects": index_failed}}
+                                   "failed_projects": index_failed},
+                "grant_subject_user_id": {"migrated": len(column_migrated), "failed": len(column_failed),
+                                          "failed_projects": column_failed}}
 
     @web.method()
     def manage_credential_reference(self, *args, **kwargs):

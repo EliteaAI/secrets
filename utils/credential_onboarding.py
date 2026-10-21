@@ -158,7 +158,7 @@ def _digest(fields) -> bytes:
 
 def _locator(store_kind):
     if store_kind == "database":
-        return {"section": "credential_store"}
+        return {"row": "cs"}   # governed material has its own row (``<db key>:cs``); the adapter ignores the locator
     return {"tenant": getattr(c, "CORPORATE_VAULT_TENANT_SEGMENT", None),
             "mount": getattr(c, "CORPORATE_VAULT_MOUNT", None) or "kv-elitea"}
 
@@ -182,6 +182,33 @@ def _store_ref(ref):
 def _mint(purpose, ref, correlation, actor):
     return secret_stores.CredentialStoreProvider.mint(
         purpose, decision_id=correlation, actor_ref=audit.operator_ref(actor), project_id=ref.project_id, ref_id=ref.id)
+
+
+KEEP_GENERATIONS = 2
+
+
+def prune_superseded(ref, generation, actor, correlation, meta=None):
+    """Drop all but the newest ``KEEP_GENERATIONS`` generations of a reference's material (the live one and the one a
+    run admitted just before may still read). Anchored to the live generation: nothing is pruned unless the newest
+    version in the store is ``generation``, so a generation staged above the live one is never touched or counted.
+    ``meta``: the store metadata when the caller already has it. ``correlation``: the id of an audit event committed
+    before this call (the store's decision id). The port allows ``prune`` to the ``retire`` and ``reconcile`` purposes
+    only, so the ``reconcile`` purpose is used here, also on the activation path. Best effort: never raises and never
+    changes a settled outcome (a failure is logged; the next generation prunes again). Returns whether it pruned."""
+    if generation <= KEEP_GENERATIONS:   # nothing can be superseded yet: no store call
+        return False
+    try:
+        store = secret_stores.get_store(ref.store_kind, governed=True)
+        ctx = _mint("reconcile", ref, correlation, actor)
+        if meta is None:
+            meta = store.metadata(_store_ref(ref), ctx)
+        if not meta.versions or max(meta.versions) != generation:
+            return False
+        store.prune(_store_ref(ref), KEEP_GENERATIONS, ctx)
+        return True
+    except Exception as exc:  # pylint: disable=W0703
+        log.error("credential store: prune failed (%s)", type(exc).__name__)
+        return False
 
 
 def write_to_store(ref, fields, generation, correlation, actor):
@@ -505,10 +532,13 @@ def _activate(values, actor):
         if not transition_reference(session, ref.id, "validated", "active", actor=actor):
             session.rollback()
             raise CredentialTaskError("CONCURRENT_CHANGE")
+        correlation = audit.new_event_id()   # the activation event is the decision id of the prune below
         audit.record(session, _event(
-            "CREDENTIAL_REF_ACTIVE", ref, actor, credential_generation=ref.generation, outcome="success",
-            approver_ref=ref.approval_ref, policy_revision=ref.policy_revision, revocation_epoch=ref.revocation_epoch))
+            "CREDENTIAL_REF_ACTIVE", ref, actor, event_id=correlation, credential_generation=ref.generation,
+            outcome="success", approver_ref=ref.approval_ref, policy_revision=ref.policy_revision,
+            revocation_epoch=ref.revocation_epoch))
         session.commit()
+    prune_superseded(ref, ref.generation, actor, correlation)   # a new generation is live: older ones are dropped
     return {"action": "activate", "reference": values["ref"], "state": "active", "dry_run": False}
 
 

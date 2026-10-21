@@ -138,28 +138,34 @@ class Module(module.ModuleModel):
         """Startup safety net: create the credential governance tables in any project schema that predates
         them (#6757). Runs off-thread; guarded by a catalog check so steady-state boots issue no DDL.
         New projects are already covered by create_all."""
+        def _step(name, find, apply):
+            """One additive step of the safety net: it never stops the others, and a project whose table was busy
+            (the lock timeout) is tried again a few times."""
+            try:
+                pending = find()
+                if pending:
+                    migrated, failed = apply(pending)
+                    log.info("credential governance schema: %s (migrated=%s failed=%s)", name, len(migrated), len(failed))
+            except Exception:  # pylint: disable=W0703
+                log.exception("credential governance schema: %s failed", name)
+
         def _run():
             try:
                 from .utils.credential_schema import (  # pylint: disable=C0415
-                    apply_credential_tables, apply_written_by, project_ids_missing_credential_tables,
+                    apply_credential_tables, apply_grant_subject_user_id, apply_with_retry, apply_written_by,
+                    project_ids_missing_credential_tables, project_ids_missing_grant_subject_user_id,
                     project_ids_missing_written_by,
                 )
-                pending = project_ids_missing_credential_tables()
-                if pending:
-                    log.info("credential governance schema: auto-migrating %s project(s)", len(pending))
-                    migrated, failed = apply_credential_tables(pending)
-                    log.info(
-                        "credential governance schema: auto-migration done (migrated=%s failed=%s)",
-                        len(migrated), len(failed),
-                    )
-                # the model reads written_by (#7119); adding the column is additive, the index swap is the task's
-                unwritten = project_ids_missing_written_by()
-                if unwritten:
-                    migrated, failed = apply_written_by(unwritten)
-                    log.info("credential governance schema: written_by added (migrated=%s failed=%s)",
-                             len(migrated), len(failed))
             except Exception:  # pylint: disable=W0703
                 log.exception("credential governance schema: auto-migration failed")
+                return
+            _step("auto-migration done", project_ids_missing_credential_tables, apply_credential_tables)
+            # the model reads written_by (#7119) and credential_use_grant.subject_user_id; adding a column is additive,
+            # the index swap is the task's
+            _step("written_by added", project_ids_missing_written_by,
+                  lambda ids: apply_with_retry(apply_written_by, ids))
+            _step("subject_user_id added", project_ids_missing_grant_subject_user_id,
+                  lambda ids: apply_with_retry(apply_grant_subject_user_id, ids))
 
         Thread(target=_run, daemon=True).start()
 

@@ -49,14 +49,32 @@ def _field_allowed(name, paths) -> bool:
     return False
 
 
+# The secret field paths are a pure function of the configuration type's registered schema, so they are asked for once per
+# type and kept until the registry of configuration types changes (its version, read from the same process each call).
+# Schema only, never material. A configurations plugin without the version is asked every time.
+_PATHS = {"version": None, "by_type": {}}
+
+
 def _secret_field_paths(provider) -> list:
     try:
-        found = this.for_module("configurations").module.configuration_secret_fields([provider])
+        service = this.for_module("configurations").module
+        try:
+            version = service.configuration_registry_version()
+        except Exception:  # pylint: disable=W0703
+            version = None   # cannot tell when the registry changes: no cache
+        if version is not None and version == _PATHS["version"] and provider in _PATHS["by_type"]:
+            return list(_PATHS["by_type"][provider])
+        found = service.configuration_secret_fields([provider])
     except Exception:  # pylint: disable=W0703
         raise CredentialTaskError("DEPENDENCY_UNAVAILABLE") from None
     if not isinstance(found, dict) or provider not in found:
         raise CredentialTaskError("INVALID_REQUEST")   # a type nobody can say the secret fields of
-    return list(found[provider])
+    paths = tuple(found[provider])
+    if version is not None:
+        if version != _PATHS["version"]:
+            _PATHS["version"], _PATHS["by_type"] = version, {}
+        _PATHS["by_type"][provider] = paths
+    return list(paths)
 
 
 def _as_secrets(fields) -> dict:

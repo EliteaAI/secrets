@@ -146,13 +146,19 @@ class Module:
 
 @pytest.fixture
 def patch_schema(gov, schema, monkeypatch):
-    state = types.SimpleNamespace(missing=[1, 2, 5], applied=[])
+    state = types.SimpleNamespace(missing=[1, 2, 5], applied=[], no_subject_column=[], column_applied=[])
 
     def apply(ids, dry_run=False):
         state.applied.append((list(ids), dry_run))
         return list(ids), []
+
+    def apply_column(ids, dry_run=False):
+        state.column_applied.append((list(ids), dry_run))
+        return list(ids), []
     monkeypatch.setattr(schema, "project_ids_missing_credential_tables", lambda: list(state.missing))
     monkeypatch.setattr(schema, "apply_credential_tables", apply)
+    monkeypatch.setattr(schema, "project_ids_missing_grant_subject_user_id", lambda: list(state.no_subject_column))
+    monkeypatch.setattr(schema, "apply_grant_subject_user_id", apply_column)
     return state
 
 
@@ -160,8 +166,19 @@ def test_the_task_creates_the_missing_tables_everywhere(tasks, patch_schema):
     module = Module()
     result = tasks.create_credential_governance_tables(module, param="project_id=all")
     assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False,
-                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []},
+                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []}}
     assert patch_schema.applied == [([1, 2, 5], False)] and module.listed == [{"create_success": True}]
+
+
+def test_the_task_adds_the_grant_subject_column_in_the_targeted_projects_only(tasks, patch_schema):
+    patch_schema.missing = []
+    patch_schema.no_subject_column = [1, 2, 9]
+    result = tasks.create_credential_governance_tables(Module(), param="project_id=all")
+    assert result["grant_subject_user_id"] == {"migrated": 2, "failed": 0, "failed_projects": []}
+    assert patch_schema.column_applied == [([1, 2], False)]   # project 9 is not in the project list
+    dry = tasks.create_credential_governance_tables(Module(), param="project_id=1;dry_run")
+    assert dry["grant_subject_user_id"]["migrated"] == 1 and patch_schema.column_applied[-1] == ([1], True)
 
 
 def test_the_task_dry_run_reports_what_it_would_create(tasks, patch_schema):
@@ -291,9 +308,11 @@ def test_a_registered_task_runs_the_method_on_the_module(gov, plugin, monkeypatc
     monkeypatch.setattr(plugin.module, "context", Module(), raising=False)
     plugin.module.ready()
     monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_credential_tables", lambda: [])
+    monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_grant_subject_user_id", lambda: [])
     result = gov.admin.tasks["create_credential_governance_tables"](param="project_id=7;dry_run")
     assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True,
-                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []},
+                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []}}
 
 
 def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
@@ -303,11 +322,14 @@ def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
     assert gov.admin.tasks == {}
 
 
-def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=()):
+def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=(), ungranted=()):
     monkeypatch.setattr(plugin.file, "Thread", lambda target, daemon: types.SimpleNamespace(start=target))
     schema = gov.module("utils.credential_schema")
     applied = []
-    plugin.written = []
+    plugin.written, plugin.granted = [], []
+    monkeypatch.setattr(schema, "project_ids_missing_grant_subject_user_id", lambda: list(ungranted))
+    monkeypatch.setattr(schema, "apply_grant_subject_user_id",
+                        lambda ids: plugin.granted.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_written_by", lambda: list(unwritten))
     monkeypatch.setattr(schema, "apply_written_by", lambda ids: plugin.written.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_credential_tables",
@@ -332,3 +354,98 @@ def test_the_startup_guard_adds_the_written_by_column_where_it_is_missing(gov, p
     assert run_guard(plugin, monkeypatch, gov, [], unwritten=[3, 9]) == [] and plugin.written == [[3, 9]]
     assert run_guard(plugin, monkeypatch, gov, [4], unwritten=[]) == [[4]] and plugin.written == []   # tables first
     assert run_guard(plugin, monkeypatch, gov, [], unwritten=[]) == [] and plugin.written == []        # steady state
+
+
+def test_the_startup_guard_adds_the_grant_subject_column_where_it_is_missing(gov, plugin, monkeypatch):
+    assert run_guard(plugin, monkeypatch, gov, [], ungranted=[3, 9]) == [] and plugin.granted == [[3, 9]]
+    assert run_guard(plugin, monkeypatch, gov, [4], ungranted=[]) == [[4]] and plugin.granted == []   # tables first
+    assert run_guard(plugin, monkeypatch, gov, [], ungranted=[]) == [] and plugin.granted == []        # steady state
+
+
+def _grant_columns(gov, project_id):
+    return {row["name"] for row in gov.db.execute(project_id, 'PRAGMA table_info("credential_use_grant")')}
+
+
+def test_the_grant_subject_column_is_added_once_and_a_dry_run_changes_nothing(gov, schema):
+    gov.db.execute(3, "ALTER TABLE tenant.credential_use_grant DROP COLUMN subject_user_id")
+    assert "subject_user_id" not in _grant_columns(gov, 3)
+    assert schema.apply_grant_subject_user_id([3], dry_run=True) == ([3], [])
+    assert "subject_user_id" not in _grant_columns(gov, 3)
+    assert schema.apply_grant_subject_user_id([3]) == ([3], [])
+    assert "subject_user_id" in _grant_columns(gov, 3)
+    assert schema.apply_grant_subject_user_id([3]) == ([3], [])   # idempotent
+    row = gov.grant(3, gov.add_grant(3))
+    assert row.subject_user_id is None   # additive and nullable: a grant made before it needs nothing
+
+
+# --- the startup guard: independent steps, retried on a busy table, idempotent DDL (review of the perf PR) -----------
+
+def test_a_project_that_hit_the_lock_timeout_is_tried_again_three_times_five_seconds_apart(schema):
+    seen, slept = [], []
+
+    def apply(ids):
+        seen.append(list(ids))
+        if len(seen) < 3:   # busy twice
+            return [], [{"project_id": pid} for pid in ids]
+        return list(ids), []
+    migrated, failed = schema.apply_with_retry(apply, [3, 9], sleep=slept.append)
+    assert (migrated, failed) == ([3, 9], []) and seen == [[3, 9], [3, 9], [3, 9]] and slept == [5, 5]
+
+    def stuck(ids):
+        seen.append(list(ids))
+        return [], [{"project_id": pid} for pid in ids]
+    seen.clear(), slept.clear()
+    migrated, failed = schema.apply_with_retry(stuck, [4], sleep=slept.append)
+    assert (migrated, failed) == ([], [{"project_id": 4}]) and len(seen) == 4 and slept == [5, 5, 5]   # 1 try + 3 retries
+
+
+def test_only_the_failed_projects_are_retried(schema):
+    seen = []
+
+    def apply(ids):
+        seen.append(list(ids))
+        return ([pid for pid in ids if pid != 9], [{"project_id": 9}]) if len(seen) == 1 else (list(ids), [])
+    assert schema.apply_with_retry(apply, [3, 9], sleep=lambda _s: None) == ([3, 9], []) and seen == [[3, 9], [9]]
+
+
+def test_the_startup_guard_steps_do_not_stop_each_other(gov, plugin, monkeypatch):
+    def boom():
+        raise RuntimeError("catalog down")
+    assert run_guard(plugin, monkeypatch, gov, boom, unwritten=[3], ungranted=[5]) == []
+    assert plugin.written == [[3]] and plugin.granted == [[5]]   # the tables step failed; the two column steps ran
+
+
+def test_the_startup_guard_retries_a_busy_project(gov, plugin, monkeypatch):
+    schema = gov.module("utils.credential_schema")
+    monkeypatch.setattr(schema.time, "sleep", lambda _s: None)
+    run_guard(plugin, monkeypatch, gov, [], ungranted=[5])
+    tries = []
+
+    def busy_once(ids):
+        tries.append(list(ids))
+        return ([], [{"project_id": pid} for pid in ids]) if len(tries) == 1 else (list(ids), [])
+    monkeypatch.setattr(schema, "apply_grant_subject_user_id", busy_once)
+    plugin.module._ensure_credential_schema()   # pylint: disable=W0212
+    assert tries == [[5], [5]]
+
+
+def test_the_column_is_added_with_if_not_exists_on_postgresql(schema):
+    class Preparer:
+        @staticmethod
+        def quote_schema(name):
+            return f'"{name}"'
+
+        @staticmethod
+        def quote(name):
+            return f'"{name}"'
+
+    def run(dialect):
+        sql = []
+        connection = types.SimpleNamespace(
+            dialect=types.SimpleNamespace(name=dialect, identifier_preparer=Preparer),
+            schema_for_object=lambda _t: "p_1", execute=lambda statement: sql.append(str(statement)))
+        schema._add_integer_column(connection, types.SimpleNamespace(name="credential_use_grant"), "subject_user_id", set())  # pylint: disable=W0212
+        schema._add_integer_column(connection, types.SimpleNamespace(name="credential_use_grant"), "subject_user_id", {"subject_user_id"})  # pylint: disable=W0212
+        return sql
+    assert run("postgresql") == ['ALTER TABLE "p_1"."credential_use_grant" ADD COLUMN IF NOT EXISTS subject_user_id INTEGER']
+    assert run("sqlite") == ['ALTER TABLE "p_1"."credential_use_grant" ADD COLUMN subject_user_id INTEGER']   # present: no second

@@ -55,6 +55,9 @@ VERSION = sa.Table("application_versions", TEST_TABLES, sa.Column("id", sa.Integ
                    sa.Column("name", sa.String), schema=SCHEMA)
 TOOL = sa.Table("elitea_tools", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
                 sa.Column("type", sa.String), sa.Column("name", sa.String), schema=SCHEMA)
+CONFIGURATION = sa.Table("configuration", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
+                         sa.Column("uuid", sa.Uuid, unique=True), sa.Column("elitea_title", sa.String),
+                         sa.Column("generation", sa.Integer), schema=SCHEMA)
 AUDIT_OUTBOX = sa.Table("audit_outbox", TEST_TABLES, sa.Column("event_id", sa.String, primary_key=True),
                         sa.Column("body", sa.Text), schema=SCHEMA)
 
@@ -100,7 +103,7 @@ def _minimal_port_types():  # the shapes of shared/tools/secret_stores, enough f
     purposes = frozenset({"onboard", "probe", "retire", "reconcile", "smoke", "release"})
     operation_purposes = {
         "read": {"probe", "reconcile", "smoke", "release"}, "write": {"onboard"}, "metadata": {"probe", "reconcile", "smoke"},
-        "delete_all": {"retire", "reconcile"},
+        "prune": {"retire", "reconcile"}, "delete_all": {"retire", "reconcile"},
     }
 
     class AuthorizedStoreContext:
@@ -168,6 +171,7 @@ class MemoryStore:
         self.port, self.kind = port, kind
         self.versions = {}  # ref_id -> {generation: {field: value}}
         self.calls = []  # (operation, purpose, decision_id)
+        self.read_many_calls = []  # one list of (ref_id, generation) per read_many call
         self.fail = {}  # operation -> store code, raised before any effect
         self.fail_after_effect = {}  # operation -> store code, raised after the effect (a timeout that did happen)
         self.crash_before_write = False
@@ -192,6 +196,25 @@ class MemoryStore:
             raise self.port.StoreError("NOT_FOUND")
         return self.port.SecretValue(bundle, generation)
 
+    def read_many(self, refs, generations, ctx):
+        """The port's ``read_many``: every context checked before any read, all or nothing, keyed
+        ``(ref_id, generation)``; a failing ref is named in ``details``. ``read_many_calls`` counts the calls."""
+        refs, generations = list(refs), [int(item) for item in generations]
+        contexts = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx] * len(refs)
+        if len(refs) != len(generations) or len(refs) != len(contexts) or len(refs) > 64:
+            raise ValueError("invalid read_many arguments")
+        self.read_many_calls.append([(ref.ref_id, generation) for ref, generation in zip(refs, generations)])
+        for ref, item_ctx in zip(refs, contexts):
+            self.port.check_context(item_ctx, ref, "read")
+        found = {}
+        for ref, generation, item_ctx in zip(refs, generations, contexts):
+            try:
+                found[(ref.ref_id, generation)] = self.read(ref, generation, item_ctx)
+            except self.port.StoreError as exc:
+                exc.details = {"ref_id": str(ref.ref_id)}
+                raise
+        return found
+
     def write(self, ref, value, *, expected_version, ctx):
         self._enter("write", ref, ctx)
         if self.crash_before_write:
@@ -209,6 +232,14 @@ class MemoryStore:
         self._enter("metadata", ref, ctx)
         found = set(self.versions.get(ref.ref_id, {}))
         return self.port.SecretMetadata(max(found, default=0), found, request_id="req-meta")
+
+    def prune(self, ref, keep_generations, ctx):
+        self._enter("prune", ref, ctx)
+        stored = self.versions.get(ref.ref_id, {})
+        for generation in sorted(stored)[:-keep_generations]:
+            del stored[generation]
+        found = set(stored)
+        return self.port.SecretMetadata(max(found, default=0), found)
 
     def delete_all(self, ref, ctx):
         self._enter("delete_all", ref, ctx)
@@ -303,15 +334,23 @@ class FakeTracing:
 # --- configurations ---------------------------------------------------------------------------------------------------
 
 class FakeConfigurations:
-    """The two in-process methods, over an in-memory table. ``bundle`` is as strict about the context as the real one."""
+    """The in-process methods, over an in-memory table. ``bundle`` is as strict about the context as the real one."""
 
-    def __init__(self, stores):
+    instances = 0
+
+    def __init__(self, stores, databases=None):
         self.stores = stores
+        self.databases = databases  # the table the credential lists join with is kept in step with ``rows``
         self.rows = {}  # project_id -> {id: row}
         self.bundle_calls = []
         self.bundle_error = None
         self.secret_paths = {"api_cred": ["api_key"]}  # type -> secret field paths (``headers.*`` = a map of passwords)
         self.secret_fields_error = None
+        FakeConfigurations.instances += 1
+        # a registry version no other fake instance used, so the plugin's in-process cache never answers for a test
+        # other than the one that filled it
+        self.registry_version = FakeConfigurations.instances * 1_000_000
+        self.secret_fields_calls = []  # the types asked of ``configuration_secret_fields``, one list per call
 
     def add(self, project_id, *, type_="api_cred", section="credentials", secrets=None, generation=1, title=None):
         rows = self.rows.setdefault(project_id, {})
@@ -320,11 +359,25 @@ class FakeConfigurations:
             generation=generation, title=title,
             secrets=dict(secrets if secrets is not None else {"api_key": FIXTURE_VALUE}))
         rows[row.id] = row
+        self._mirror(row, insert=True)
         return row
+
+    def _mirror(self, row, insert=False):
+        if self.databases is None:
+            return
+        with self.databases.get_session(row.project_id) as session:
+            if insert:
+                session.execute(CONFIGURATION.insert().values(
+                    id=row.id, uuid=uuid.UUID(row.uuid), elitea_title=row.title, generation=row.generation))
+            else:
+                session.execute(CONFIGURATION.update().where(CONFIGURATION.c.id == row.id).values(
+                    generation=row.generation))
+            session.commit()
 
     def edit_secret(self, row, **secrets):
         row.secrets.update(secrets)
         row.generation += 1
+        self._mirror(row)
 
     def configuration_credential_facts(self, project_id, uuids):
         """The shape of the real method: ``{uuid: {id, project_id, type, section, generation, title}}`` (``title`` is the
@@ -333,8 +386,13 @@ class FakeConfigurations:
                            "generation": row.generation, "title": row.title}
                 for row in self.rows.get(project_id, {}).values() if row.uuid in uuids}
 
+    def configuration_registry_version(self):
+        """The shape of the real method: a number that changes whenever a configuration type is (un)registered."""
+        return self.registry_version
+
     def configuration_secret_fields(self, types):
         """The shape of the real method: ``{type: [path, ...]}``, an unregistered type left out."""
+        self.secret_fields_calls.append(list(types))
         if self.secret_fields_error:
             raise self.secret_fields_error
         return {name: list(self.secret_paths[name]) for name in types if name in self.secret_paths}
@@ -496,11 +554,14 @@ class Governance:
         self.installed = True
 
     def reset(self, directory):
+        queries = sys.modules.get(f"{ALIAS}.utils.credential_queries")
+        if queries is not None:   # the per-process memory of subjects nobody could name belongs to one test
+            queries._UNRESOLVABLE.clear()  # pylint: disable=W0212
         self.stores.reset()
         self.db.dispose()
         self.db.start(directory)
         self.tracing = FakeTracing()
-        self.configurations = FakeConfigurations(self.stores)
+        self.configurations = FakeConfigurations(self.stores, self.db)
         self.admin = FakeAdmin()
         self.core = FakeCore()
         self._saved_modules = dict(self.this.modules)  # other suites keep their own entries (elitea_core config)
@@ -532,7 +593,7 @@ class Governance:
         models = self.module("models.credential_governance")
         values = dict(
             project_id=project_id, configuration_id=self._next(), configuration_uuid=uuid.uuid4(), provider="api_cred",
-            ownership_class="project_shared", store_kind="database", store_locator={"section": "credential_store"},
+            ownership_class="project_shared", store_kind="database", store_locator={"row": "cs"},
             created_by=10, state=state, generation=generation)
         if state in ("active", "suspended"):
             values.update(generation=max(generation, 1), approved_by=20, approval_ref="CHG-1", policy_revision="rev-1",

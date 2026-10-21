@@ -160,8 +160,8 @@ def test_the_answer_has_no_locator_secret_or_store_path(gov, facts):
 
 def test_the_facts_version_is_exported_where_a_startup_check_can_read_it(gov, facts):
     _, method = facts
-    assert method.CREDENTIAL_FACTS_VERSION == 3 == method.Method.CREDENTIAL_FACTS_VERSION
-    assert method.Method.credential_facts_version(object()) == 3
+    assert method.CREDENTIAL_FACTS_VERSION == 4 == method.Method.CREDENTIAL_FACTS_VERSION
+    assert method.Method.credential_facts_version(object()) == 4
 
 
 def test_grant_facts_carry_the_subject_kind_for_both_kinds(gov, facts):
@@ -192,3 +192,137 @@ def test_the_new_facts_still_leave_out_the_locator_and_the_custodian_record(gov,
     assert "custodian_user_id" in blob
     for forbidden in ("locator", "secret/x", "note", "custodian_ref"):
         assert forbidden not in blob
+
+
+# --- grants_for: references and the grants on them in one session (perf review 2026-10-21, M4/M5) ----------------------
+
+def _count_sessions(gov, monkeypatch):
+    opened = []
+    real = gov.tools.db.get_session
+
+    def counting(project_id=None):
+        opened.append(project_id)
+        return real(project_id)
+
+    monkeypatch.setattr(gov.tools.db, "get_session", counting)
+    return opened
+
+
+def _active_with_grant(gov, toolkit="41", subject=SUBJECT, **ref_kwargs):
+    ref_id = gov.add_reference(PROJECT, state="active", **ref_kwargs)
+    binding = uuid.uuid4()
+    grant = gov.grant(PROJECT, gov.add_grant(
+        PROJECT, state="active", agent_binding_ref=binding, credential_ref=ref_id, toolkit_instance_id=toolkit,
+        subject_ref=subject))
+    return gov.reference(PROJECT, ref_id), grant
+
+
+def test_grants_for_a_configuration_id_answers_references_and_grants_from_one_session(gov, facts, monkeypatch):
+    call, method = facts
+    ref, grant = _active_with_grant(gov)
+    opened = _count_sessions(gov, monkeypatch)
+    result = call(PROJECT, [ref.configuration_id], [], grants_for=[
+        (grant.agent_binding_ref, grant.toolkit_instance_id, ref.configuration_id, "*", SUBJECT)])
+    assert opened == [PROJECT]
+    assert list(result["references"]) == [ref.configuration_id]
+    key = method.grant_key_string((str(grant.agent_binding_ref), "41", str(ref.id), "*", SUBJECT))
+    assert list(result["grants"]) == [key] and result["grants"][key]["grant_id"] == str(grant.id)
+
+
+def test_grants_for_a_reference_id_is_the_same_as_grant_keys(gov, facts):
+    call, _ = facts
+    ref, grant = _active_with_grant(gov)
+    via_keys = call(PROJECT, [], [grant_key(grant)])
+    assert call(PROJECT, [], [], grants_for=[grant_key(grant)]) == via_keys
+    assert call(PROJECT, [], [], grants_for=[dict(zip(
+        ("agent_binding_ref", "toolkit_instance_id", "credential_ref", "target_ref", "subject_ref"), grant_key(grant)))]
+    ) == via_keys
+
+
+def test_grants_for_follows_the_reference_the_call_chose_for_the_caller(gov, facts):
+    call, _ = facts
+    owner = "idp:t1:owner"
+    shared = gov.add_reference(PROJECT, state="active", configuration_id=51)
+    personal = gov.add_reference(
+        PROJECT, state="active", configuration_id=51, ownership_class="personal",
+        custodian_ref={"user_id": 7, "subject_ref": owner})
+    binding = uuid.uuid4()
+    for ref in (shared, personal):
+        gov.add_grant(PROJECT, state="active", agent_binding_ref=binding, credential_ref=ref, subject_ref=owner)
+    wanted = [(binding, "41", 51, "*", owner)]
+    mine = call(PROJECT, [51], [], personal_subject_ref=owner, grants_for=wanted)
+    assert mine["references"][51]["ref_id"] == str(personal)
+    assert [key.split("|")[2] for key in mine["grants"]] == [str(personal)]
+    others = call(PROJECT, [51], [], personal_subject_ref="idp:t1:other", grants_for=wanted)
+    assert others["references"][51]["ref_id"] == str(shared)
+    assert [key.split("|")[2] for key in others["grants"]] == [str(shared)]
+
+
+def test_grants_for_a_configuration_without_a_reference_has_no_grant(gov, facts):
+    call, _ = facts
+    result = call(PROJECT, [999], [], grants_for=[(uuid.uuid4(), "41", 999, "*", SUBJECT)])
+    assert result == {"references": {}, "grants": {}}
+
+
+def test_grants_for_combines_with_grant_keys_and_other_projects_stay_out(gov, facts):
+    call, _ = facts
+    ref, grant = _active_with_grant(gov)
+    other_ref, other_grant = _active_with_grant(gov, toolkit="42")
+    foreign = gov.grant(PROJECT + 1, gov.add_grant(PROJECT + 1, state="active"))
+    result = call(PROJECT, [ref.configuration_id], [grant_key(other_grant)], grants_for=[
+        (grant.agent_binding_ref, "41", ref.configuration_id, "*", SUBJECT), grant_key(foreign)])
+    assert {key.split("|")[1] for key in result["grants"]} == {"41", "42"} and len(result["grants"]) == 2
+
+
+@pytest.mark.parametrize("selectors", [1, 8, 64])
+def test_one_session_whatever_the_number_of_selectors(gov, facts, monkeypatch, selectors):
+    call, _ = facts
+    refs = [gov.reference(PROJECT, gov.add_reference(PROJECT, state="active")) for _ in range(selectors)]
+    binding = uuid.uuid4()
+    keys = [(binding, "41", ref.configuration_id, "*", SUBJECT) for ref in refs]
+    explicit = [(binding, "42", ref.id, "*", SUBJECT) for ref in refs]
+    opened = _count_sessions(gov, monkeypatch)
+    call(PROJECT, [ref.configuration_id for ref in refs], explicit, ref_ids=[ref.id for ref in refs], grants_for=keys)
+    assert opened == [PROJECT]
+
+
+def test_grants_for_runs_two_selects_for_references_and_grants(gov, facts):
+    import sqlalchemy as sa  # pylint: disable=C0415
+    call, _ = facts
+    refs = [gov.reference(PROJECT, gov.add_reference(PROJECT, state="active")) for _ in range(6)]
+    binding = uuid.uuid4()
+    statements = []
+    sa.event.listen(gov.db.engine(PROJECT), "before_cursor_execute", lambda *a: statements.append(a[2]))
+    call(PROJECT, [ref.configuration_id for ref in refs], [], grants_for=[
+        (binding, "41", ref.configuration_id, "*", SUBJECT) for ref in refs])
+    assert len([s for s in statements if s.lstrip().upper().startswith("SELECT")]) == 2  # references, grants
+
+
+def test_grants_for_limits_and_malformed_keys(gov, facts):
+    call, _ = facts
+    key = (uuid.uuid4(), "1", 5, "*", SUBJECT)
+    assert call(PROJECT, [], [], grants_for=[key] * 64) == {"references": {}, "grants": {}}
+    for bad in ([key] * 65, "x", [("only", "three", "parts")], [(uuid.uuid4(), "1", True, "*", SUBJECT)],
+                [(uuid.uuid4(), "1", "not-a-uuid", "*", SUBJECT)], [(uuid.uuid4(), "1", None, "*", SUBJECT)],
+                [{"agent_binding_ref": str(uuid.uuid4())}]):
+        with pytest.raises(ValueError):
+            call(PROJECT, [], [], grants_for=bad)
+
+
+def test_a_pending_personal_reference_hides_the_grant_of_the_shared_one_it_shadows(gov, facts):
+    """The owner registered a value that is still pending: the shared credential is not a silent fallback, so the grant
+    on the shared reference is not offered for the owner's run (the personal reference is the chosen one)."""
+    call, _ = facts
+    owner = "idp:t1:owner"
+    shared = gov.add_reference(PROJECT, state="active", configuration_id=61)
+    personal = gov.add_reference(
+        PROJECT, state="pending", configuration_id=61, ownership_class="personal",
+        custodian_ref={"user_id": 7, "subject_ref": owner})
+    binding = uuid.uuid4()
+    gov.add_grant(PROJECT, state="active", agent_binding_ref=binding, credential_ref=shared, subject_ref=owner)
+    wanted = [(binding, "41", 61, "*", owner)]
+    mine = call(PROJECT, [61], [], personal_subject_ref=owner, grants_for=wanted)
+    assert mine["references"][61]["ref_id"] == str(personal) and mine["references"][61]["state"] == "pending"
+    assert "note" in mine["references"][61] and mine["grants"] == {}
+    others = call(PROJECT, [61], [], personal_subject_ref="idp:t1:other", grants_for=wanted)   # anyone else gets the shared one
+    assert others["references"][61]["ref_id"] == str(shared) and len(others["grants"]) == 1

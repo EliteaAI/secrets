@@ -28,7 +28,9 @@ MAX_SUBJECT_CHARS = 160
 # 2: grant facts carry ``subject_kind`` and reference facts ``custodian_user_id`` (read by elitea_core's startup check).
 # 3: reference facts carry ``custodian_subject_ref``, and ``credential_use_facts`` takes the caller's identity to find
 #    the caller's own personal reference of a configuration (#7119).
-CREDENTIAL_FACTS_VERSION = 3
+# 4: ``credential_use_facts`` takes ``grants_for`` (grant keys whose credential may be named by configuration id), so
+#    references and the grants on them are one session (perf review 2026-10-21, M4/M5). The result shape is v3's.
+CREDENTIAL_FACTS_VERSION = 4
 KEY_FIELDS = ("agent_binding_ref", "toolkit_instance_id", "credential_ref", "target_ref", "subject_ref")
 
 
@@ -59,6 +61,26 @@ def _key(item) -> tuple:
         raise ValueError("grant key needs exactly " + ", ".join(KEY_FIELDS))
     binding, toolkit, credential, target, subject = item
     return str(_uuid(binding)), str(toolkit), str(_uuid(credential)), str(target), str(subject)
+
+
+def _grant_for(item) -> tuple:
+    """A ``grants_for`` key: a grant key whose credential is a reference id, or the id (an integer) of a configuration
+    in this call's ``config_ids``/``ref_ids``, meaning the reference the call resolved for it. Returns the key with
+    the credential as ``uuid.UUID`` or ``int``."""
+    if isinstance(item, dict):
+        if set(item) != set(KEY_FIELDS):
+            raise ValueError("grant key needs exactly " + ", ".join(KEY_FIELDS))
+        item = [item[name] for name in KEY_FIELDS]
+    if not isinstance(item, (list, tuple)) or len(item) != len(KEY_FIELDS):
+        raise ValueError("grant key needs exactly " + ", ".join(KEY_FIELDS))
+    binding, toolkit, credential, target, subject = item
+    if isinstance(credential, bool):
+        raise ValueError("grant key: a reference id or a configuration id")
+    if isinstance(credential, int):
+        wanted = credential
+    else:
+        wanted = _uuid(credential)
+    return str(_uuid(binding)), str(toolkit), wanted, str(target), str(subject)
 
 
 def _custodian_user_id(custodian_ref):
@@ -135,7 +157,7 @@ class Method:
     @web.method()
     def credential_use_facts(  # pylint: disable=R0913
         self, project_id: int, config_ids: list, grant_keys: list, ref_ids: list = None,
-        personal_subject_ref: str = None, personal_user_id: int = None,
+        personal_subject_ref: str = None, personal_user_id: int = None, grants_for: list = None,
     ) -> dict:
         """Live credential references and grants, for admission and the re-check of a queued run.
 
@@ -152,6 +174,14 @@ class Method:
 
         References are keyed by configuration id whichever selector found them. Times are ISO-8601 strings.
 
+        ``grants_for`` (optional, at most 64): grant keys in the same form as ``grant_keys``, answered in the same
+        session as the references, for the callers that learn the reference only from this call. The credential of a
+        key is either a reference id (then it is exactly ``grant_keys``) or an integer: the id of a configuration
+        among ``config_ids`` (or of a reference found by ``ref_ids``), meaning the reference this call resolved for it,
+        the caller's own personal one first. The grant is returned under the key string built with that reference's
+        id (``grant_key_string((binding, toolkit, references[config]["ref_id"], target, subject))``); a configuration
+        with no reference has no grant. One ``db.get_session`` per call, whatever the number of selectors.
+
         A configuration can have a shared reference and personal ones (one per owner). ``ref_ids`` return exactly
         those references. ``config_ids`` return the personal reference whose custodian is the caller
         (``personal_subject_ref`` = ``idp:<tenant>:<object>``, or ``personal_user_id``), else the non-personal one,
@@ -162,6 +192,7 @@ class Method:
         configs = [int(item) for item in _bounded("config_ids", config_ids)]
         refs = [_uuid(item) for item in _bounded("ref_ids", ref_ids)]
         keys = {_key(item) for item in _bounded("grant_keys", grant_keys)}
+        later = [_grant_for(item) for item in _bounded("grants_for", grants_for)]
         references, grants = {}, {}
         with db.get_session(project_id) as session:
             if refs:
@@ -173,6 +204,13 @@ class Method:
             if wanted:
                 references.update(_references_of_configurations(
                     session, project_id, wanted, personal_subject_ref, personal_user_id))
+            for binding, toolkit, credential, target, subject in later:  # the reference is known now
+                if isinstance(credential, int):
+                    found_ref = references.get(credential)
+                    if found_ref is None:
+                        continue
+                    credential = found_ref["ref_id"]
+                keys.add((binding, toolkit, str(credential), target, subject))
             if keys:
                 for row in session.execute(select(CredentialUseGrant).where(
                         CredentialUseGrant.project_id == project_id, CredentialUseGrant.state != "revoked",

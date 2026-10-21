@@ -5,6 +5,11 @@ The reconciler settles ledger rows an import or a retire left behind (a crash be
 database, or a store that timed out). It looks at the store before it decides: a staged generation that
 reached the store is committed, one that did not is released, and the material of a retired or missing
 reference is deleted. It never deletes the material of a live reference. Each outcome is an audit event.
+
+When the reconciler makes a new generation current (it rolls a staged generation forward; a commit that was done and
+only the ledger behind is closed without touching the store), it prunes the store down to the newest two generations,
+with the metadata it just read (``credential_onboarding.prune_superseded``, also called when a reference is activated).
+The prune is anchored to that generation and best effort: see there.
 """
 import uuid
 from collections import Counter
@@ -18,7 +23,7 @@ from tools import secret_stores
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger
 from . import credential_audit as audit
 from .credential_errors import CredentialTaskError, require_actor, store_error_result
-from .credential_onboarding import _configuration_facts, _mint, _store_ref
+from .credential_onboarding import _configuration_facts, _mint, _store_ref, prune_superseded
 from .credential_schema import (
     parse_project_param, project_ids_missing_credential_tables, project_tx, target_project_ids,
 )
@@ -113,7 +118,7 @@ def _settle_write(project_id, row, ref, view, actor):  # pylint: disable=R0911
         return _delete_material(project_id, row, view, actor, "abandoned", "CREDENTIAL_RECONCILED_ABANDONED")
     if ref.generation >= generation:  # the commit went through; only the ledger lagged
         _close(project_id, row, view, actor, "committed", "CREDENTIAL_RECONCILED_COMMITTED")
-        return "healed"
+        return "healed"  # the store is not touched
     if ref.pending_generation != generation:  # nothing staged: leave the store alone
         _close(project_id, row, view, actor, "abandoned", "CREDENTIAL_RECONCILED_ABANDONED")
         return "abandoned"
@@ -135,6 +140,8 @@ def _settle_write(project_id, row, ref, view, actor):  # pylint: disable=R0911
     done = _close(project_id, row, view, actor, "committed", "CREDENTIAL_RECONCILED_COMMITTED",
                   commit=True,
                   configuration_generation=(facts or {}).get("generation"))
+    if done:
+        prune_superseded(view, row.generation, actor, correlation, meta)
     return "rolled_forward" if done else "deferred"
 
 

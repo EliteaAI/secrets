@@ -695,3 +695,19 @@ def test_the_store_context_is_minted_for_the_exact_reference_and_project(gov, fl
     with pytest.raises(gov.stores.StoreError) as caught:
         gov.stores.stores["database"].write(ref, gov.stores.SecretValue({"a": "b"}, 2), expected_version=1, ctx=other)
     assert caught.value.code == "DENIED"
+
+
+def test_a_new_database_reference_points_at_the_governed_row_and_a_vault_one_at_its_mount(gov):
+    onboarding = gov.module("utils.credential_onboarding")
+    config = gov.configurations.add(3)
+    made = {}
+    for kind in ("database", "corporate_vault"):
+        param = (f"project_id=3;action=create;configuration_uuid={config.uuid};store_kind={kind};"
+                 "ownership_class=service")
+        result = onboarding.manage_reference(param, 10)
+        assert result["state"] == "pending", result
+        made[kind] = gov.reference(3, uuid.UUID(result["reference"]))
+        gov.db.execute(3, "UPDATE tenant.credential_reference SET state = 'retired' WHERE id = :id",
+                       id=made[kind].id.hex)   # one live reference per configuration
+    assert made["database"].store_locator == {"row": "cs"}   # not the stale {"section": "credential_store"}
+    assert set(made["corporate_vault"].store_locator) == {"tenant", "mount"}
