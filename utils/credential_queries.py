@@ -211,40 +211,43 @@ def _mark_unresolved(project_id, subjects):
 _BULK = {"unavailable_until": 0.0}   # monotonic time until which the bulk subject lookup is not tried
 
 
-def _is_user(user) -> bool:
-    return isinstance(user, dict) and isinstance(user.get("id"), int)
-
-
 def _bulk_users(issuer, pairs):
-    """``{"tid:oid": user}`` from ``auth_get_users_by_idp_subjects`` (one call per ``BULK_SUBJECTS_PER_CALL`` subjects,
-    so one for a page), or None when it cannot be used: a pylon_auth without the handler never answers (``queue.Empty``
-    or a timeout), which is remembered for ``BULK_UNAVAILABLE_TTL_S`` so a page does not wait for it again. Any other
-    failure is logged and also leaves the subjects to the single lookup of the caller."""
+    """``(found, remaining, timed_out)``: ``found`` is ``{"tid:oid": user}`` from ``auth_get_users_by_idp_subjects`` (one
+    call per ``BULK_SUBJECTS_PER_CALL`` subjects, so one for a page); ``remaining`` are the pairs the bulk call did not
+    answer (every pair when it is not tried, or those of the chunk that failed and the ones after it; the answers of
+    earlier chunks are kept); ``timed_out``: the failure was ``queue.Empty``/a timeout, which is what a pylon_auth without
+    the handler looks like (the caller remembers that only if the single lookups then answer). An answer that is not a
+    dict is a failure. Other failures are logged."""
     if _clock() < _BULK["unavailable_until"]:
-        return None
+        return {}, list(pairs), False
     found = {}
     try:
         rpc = this.for_module("secrets").module.context.rpc_manager.timeout(BULK_RPC_TIMEOUT_S)
-        for start in range(0, len(pairs), BULK_SUBJECTS_PER_CALL):
-            answer = rpc.auth_get_users_by_idp_subjects(
-                issuer=issuer, subjects=[{"tid": tid, "oid": oid} for tid, oid in pairs[start:start + BULK_SUBJECTS_PER_CALL]])
-            if isinstance(answer, dict):
-                found.update(answer)
-    except (queue.Empty, TimeoutError):
-        _BULK["unavailable_until"] = _clock() + BULK_UNAVAILABLE_TTL_S
-        log.warning("credential api: bulk subject lookup not answered, using single lookups for %ss", BULK_UNAVAILABLE_TTL_S)
-        return None
     except Exception as exc:  # pylint: disable=W0703
-        log.error("credential api: bulk subject lookup failed (%s)", type(exc).__name__)
-        return None
-    return found
+        log.error("credential api: bulk subject lookup unavailable (%s)", type(exc).__name__)
+        return {}, list(pairs), False
+    for start in range(0, len(pairs), BULK_SUBJECTS_PER_CALL):
+        chunk = pairs[start:start + BULK_SUBJECTS_PER_CALL]
+        try:
+            answer = rpc.auth_get_users_by_idp_subjects(
+                issuer=issuer, subjects=[{"tid": tid, "oid": oid} for tid, oid in chunk])
+            if not isinstance(answer, dict):
+                raise TypeError("bulk subject lookup answered a non-dict")
+        except (queue.Empty, TimeoutError):
+            return found, list(pairs[start:]), True
+        except Exception as exc:  # pylint: disable=W0703
+            log.error("credential api: bulk subject lookup failed (%s)", type(exc).__name__)
+            return found, list(pairs[start:]), False
+        found.update(answer)
+    return found, [], False
 
 
 def _single_users(issuer, pairs):
-    """The same answer as ``_bulk_users``, one ``get_user_by_idp_subject`` for each subject. A lookup that fails is
-    logged and leaves the subject unnamed; an identity service that does not answer at all ends the loop (each further
-    subject would wait for the same timeout)."""
-    found = {}
+    """``(found, answered)``: ``found`` as of ``_bulk_users``, one ``get_user_by_idp_subject`` for each subject;
+    ``answered``: the pairs the identity service did answer (found or not). A lookup that fails is logged and the pair is
+    not answered; an identity service that does not answer at all ends the loop (each further subject would wait for
+    the same timeout), the rest are not answered either."""
+    found, answered = {}, set()
     for tid, oid in pairs:
         try:
             user = auth.get_user_by_idp_subject(issuer, tid, oid)
@@ -254,32 +257,51 @@ def _single_users(issuer, pairs):
         except Exception as exc:  # pylint: disable=W0703
             log.error("credential api: subject lookup failed (%s)", type(exc).__name__)
             continue
+        answered.add((tid, oid))
         if user is not None:
             found[f"{tid}:{oid}"] = user
-    return found
+    return found, answered
 
 
-def _users_of_subjects(subjects, issuers) -> dict:
-    """``{subject_ref: {id, email}}`` for subjects whose tenant has a known issuer: one bulk lookup per issuer (normally
-    one for the page; the caller bounds the subjects by the page), the single lookup for each subject when the identity
-    service has no bulk one. A lookup that fails is logged and leaves the subject unnamed."""
+def _is_user_of(user, tid, oid) -> bool:
+    """An answer is trusted only for the subject that was asked for."""
+    return (isinstance(user, dict) and isinstance(user.get("id"), int) and not isinstance(user.get("id"), bool)
+            and user.get("idp_tid") == tid and user.get("idp_oid") == oid)
+
+
+def _users_of_subjects(subjects, issuers):
+    """``({subject_ref: {id, email}}, unanswered)`` for subjects whose tenant has a known issuer: one bulk lookup per
+    issuer (normally one for the page; the caller bounds the subjects by the page), the single lookup for each subject
+    the bulk call did not answer. ``unanswered``: subject refs the identity service never answered about (a failure or
+    a timeout), as opposed to answered "nobody": the caller must not remember those as unresolvable. A lookup that fails
+    is logged and leaves the subject unnamed. A pylon_auth without the bulk call is remembered for
+    ``BULK_UNAVAILABLE_TTL_S`` only when the single lookups of the same page do answer (else it is an outage)."""
     by_issuer = {}
     for subject in sorted(subjects):
         _, tid, oid = subject.split(":", 2)
         issuer = issuers.get(tid)
         if issuer is not None:
             by_issuer.setdefault(issuer, []).append((subject, tid, oid))
-    named = {}
+    named, unanswered = {}, set()
     for issuer, items in by_issuer.items():
         pairs = [(tid, oid) for _, tid, oid in items]
-        users = _bulk_users(issuer, pairs)
-        if users is None:
-            users = _single_users(issuer, pairs)
+        users, remaining, timed_out = _bulk_users(issuer, pairs)
+        answered = set(pairs) - set(remaining)
+        if remaining:
+            singles, single_answered = _single_users(issuer, remaining)
+            users.update(singles)
+            answered |= single_answered
+            if timed_out and single_answered:
+                _BULK["unavailable_until"] = _clock() + BULK_UNAVAILABLE_TTL_S
+                log.warning("credential api: bulk subject lookup not answered, using single lookups for %ss",
+                            BULK_UNAVAILABLE_TTL_S)
         for subject, tid, oid in items:
             user = users.get(f"{tid}:{oid}")
-            if _is_user(user):
+            if _is_user_of(user, tid, oid):
                 named[subject] = {"id": user["id"], "email": user.get("email")}
-    return named
+            if (tid, oid) not in answered:
+                unanswered.add(subject)
+    return named, unanswered
 
 
 def _user(by_id, user_id):
@@ -467,7 +489,7 @@ def _present_grants(project_id, rows, known_subject=None):
     if known_subject and known_subject[1] in users:
         subjects.setdefault(known_subject[0], users[known_subject[1]])
     # by subject, with the issuer of the tenant as the page's own users show it: one lookup per distinct subject
-    named = _users_of_subjects(unknown - set(subjects), issuers)
+    named, unanswered = _users_of_subjects(unknown - set(subjects), issuers)
     users.update({user["id"]: user for user in named.values()})
     subjects.update(named)
     left = unknown - set(subjects)
@@ -476,7 +498,7 @@ def _present_grants(project_id, rows, known_subject=None):
         users.update(members)
         subjects.update(member_subjects)
         if members:   # the identity service answered: these subjects are not among the people it knows (not an outage)
-            _mark_unresolved(project_id, left - set(subjects))
+            _mark_unresolved(project_id, left - set(subjects) - unanswered)
     _remember_subjects(project_id, rows, subjects)
     present = []
     for row in rows:

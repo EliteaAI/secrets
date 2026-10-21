@@ -52,7 +52,9 @@ class Rest:
         self.projects = {P1, P2}
         self.project_rpc_down = False
         self.user_calls, self.member_calls, self.subject_calls = [], 0, []
-        self.bulk_calls, self.bulk_mode = [], "ok"   # bulk mode: ok | missing (pylon_auth without the handler)
+        self.bulk_calls, self.bulk_timeouts, self.bulk_mode = [], [], "ok"
+        # bulk mode: ok | missing (pylon_auth without the handler) | error (the handler refuses) | non_dict | wrong_user
+        self.bulk_fail_on = None   # the number of the bulk call that raises a RuntimeError
         self.onboarding = gov.module("utils.credential_onboarding")
         self.grants = gov.module("utils.credential_grants")
         self.set_actor(CREATOR)
@@ -94,14 +96,23 @@ class Rest:
             self.bulk_calls.append((issuer, [(item["tid"], item["oid"]) for item in subjects]))
             if self.bulk_mode == "missing":
                 raise queue.Empty()
+            if self.bulk_mode == "error" or self.bulk_fail_on == len(self.bulk_calls):
+                raise RuntimeError("At most 200 subjects per call")
             if self.identity_down:
                 raise ConnectionError("down")
+            if self.bulk_mode == "non_dict":
+                return []
+            if self.bulk_mode == "wrong_user":   # every key answered with the record of somebody else
+                return {f"{item['tid']}:{item['oid']}": dict(self.users[CREATOR]) for item in subjects}
             wanted = {(item["tid"], item["oid"]) for item in subjects}
             return {f"{u['idp_tid']}:{u['idp_oid']}": dict(u) for u in self.users.values()
                     if u["idp_issuer"] == issuer and (u["idp_tid"], u["idp_oid"]) in wanted}
 
-        rpc = types.SimpleNamespace(timeout=lambda seconds: types.SimpleNamespace(
-            auth_get_users_by_idp_subjects=auth_get_users_by_idp_subjects))
+        def with_timeout(seconds):
+            self.bulk_timeouts.append(seconds)
+            return types.SimpleNamespace(auth_get_users_by_idp_subjects=auth_get_users_by_idp_subjects)
+
+        rpc = types.SimpleNamespace(timeout=with_timeout)
         self.monkeypatch.setitem(self.gov.this.modules, "secrets", types.SimpleNamespace(
             module=types.SimpleNamespace(context=types.SimpleNamespace(rpc_manager=rpc))))
 
@@ -1215,15 +1226,16 @@ def test_a_subject_lookup_that_fails_is_retried_not_remembered(rest):
     assert rest.list_grants()[0]["rows"][0]["subject"]["user"]["id"] == MEMBER
 
 
-def _legacy_grants(rest, count):
-    """``count`` grants made before the column, each for another user of the identity service (all of tenant t1)."""
+def _legacy_grants(rest, count, tenant=lambda n: ("t1", "https://issuer.test"), actor=lambda n: None):
+    """``count`` grants made before the column, each for another user of the identity service (by default of tenant t1)."""
     ref = rest.new_ref(P1, until="active")
     for n in range(count):
         user_id = 2000 + n
-        rest.users[user_id] = user(user_id, f"legacy{n}@x.test", oid=f"legacy{n}")
+        tid, issuer = tenant(n)
+        rest.users[user_id] = {**user(user_id, f"legacy{n}@x.test", tid=tid, oid=f"legacy{n}"), "idp_issuer": issuer}
         rest.members.append(user_id)
         binding = rest.seed_binding(application_id=300 + n, version_id=400 + n, tools=(500 + n,))
-        assert rest.create_grant(binding, ref, subject_user_id=user_id, toolkit_id=500 + n)[1] == 201
+        assert rest.create_grant(binding, ref, subject_user_id=user_id, toolkit_id=500 + n, actor=actor(n))[1] == 201
     rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")   # made before the column
     rest.member_calls, rest.subject_calls, rest.bulk_calls = 0, [], []
 
@@ -1282,27 +1294,147 @@ def test_without_the_bulk_call_the_subjects_are_looked_up_one_by_one_and_the_gap
     assert len(rest.bulk_calls) == 1 and len(rest.subject_calls) == 6
 
 
+def _single_lookups_time_out(rest):
+    def unanswered(issuer, tid, oid):
+        rest.subject_calls.append((issuer, tid, oid))
+        raise queue.Empty()
+
+    rest.monkeypatch.setattr(StubAuth, "get_user_by_idp_subject", staticmethod(unanswered), raising=False)
+
+
+def _single_lookups_answer(rest):
+    def answer(issuer, tid, oid):
+        rest.subject_calls.append((issuer, tid, oid))
+        found = [u for u in rest.users.values() if (u["idp_issuer"], u["idp_tid"], u["idp_oid"]) == (issuer, tid, oid)]
+        return dict(found[0]) if found else None
+
+    rest.monkeypatch.setattr(StubAuth, "get_user_by_idp_subject", staticmethod(answer), raising=False)
+
+
 def test_an_unanswering_identity_service_costs_one_single_lookup_not_one_per_subject(rest):
     _legacy_grants(rest, 4)
     rest.bulk_mode = "missing"
-    real = rest.subject_calls.append
-
-    def unanswered(call):
-        real(call)
-        raise queue.Empty()
-
-    rest.monkeypatch.setattr(StubAuth, "get_user_by_idp_subject",
-                             staticmethod(lambda issuer, tid, oid: unanswered((issuer, tid, oid))), raising=False)
+    _single_lookups_time_out(rest)
     assert rest.list_grants(limit=20)[1] == 200   # still listed (the members of the project name the subjects)
     assert len(rest.subject_calls) == 1
 
 
+def test_subjects_that_were_never_answered_are_not_remembered_as_unresolvable_and_are_asked_again(rest):
+    queries = rest.gov.module("utils.credential_queries")
+    _legacy_grants(rest, 4)
+    rest.members = [CREATOR]   # the members answer, and the subjects are not among them
+    rest.bulk_mode = "missing"
+    _single_lookups_time_out(rest)   # the first single lookup times out; the other three are never asked
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert all(row["subject"]["user"] is None for row in rows) and len(rest.subject_calls) == 1
+    assert queries._UNRESOLVABLE == {}   # nothing was answered "nobody"
+    # the next page load asks for all of them again
+    rest.bulk_mode = "ok"
+    queries._BULK["unavailable_until"] = 0.0
+    rest.subject_calls.clear()
+    _single_lookups_answer(rest)
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert {row["subject"]["user"]["email"] for row in rows} == {f"legacy{n}@x.test" for n in range(4)}
+
+
+def test_a_subject_answered_nobody_is_remembered_but_one_not_asked_is_not(rest):
+    queries = rest.gov.module("utils.credential_queries")
+    _legacy_grants(rest, 2)
+    rest.members = [CREATOR]
+    del rest.users[2000]   # the identity service answers "nobody" for the first subject only
+    rest.bulk_mode = "ok"
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert sorted(row["subject"]["user"] is None for row in rows) == [False, True]
+    assert {subject for _, subject in queries._UNRESOLVABLE} == {"idp:t1:legacy0"}
+
+
+def test_a_missing_bulk_handler_is_not_remembered_when_the_single_lookups_do_not_answer_either(rest):
+    queries = rest.gov.module("utils.credential_queries")
+    _legacy_grants(rest, 3)
+    rest.members = [CREATOR]
+    rest.bulk_mode = "missing"
+    _single_lookups_time_out(rest)   # an outage of pylon_auth, not a missing handler
+    rest.list_grants(limit=20)
+    assert queries._BULK["unavailable_until"] == 0.0
+    rest.list_grants(limit=20)
+    assert len(rest.bulk_calls) == 2   # the bulk call is tried again
+
+
+def test_a_failing_chunk_keeps_the_answers_of_the_chunks_before_it(rest, monkeypatch):
+    queries = rest.gov.module("utils.credential_queries")
+    monkeypatch.setattr(queries, "BULK_SUBJECTS_PER_CALL", 2)
+    _legacy_grants(rest, 5)
+    rest.bulk_fail_on = 2   # the second chunk is refused
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert all(row["subject"]["user"] for row in rows)
+    assert [len(call[1]) for call in rest.bulk_calls] == [2, 2]   # the third chunk is not tried after a failure
+    assert len(rest.subject_calls) == 3   # the first chunk needed no single lookup
+    assert queries._BULK["unavailable_until"] == 0.0   # a refusal is not a missing handler
+
+
 def test_a_bulk_lookup_that_fails_leaves_the_page_listed_and_is_retried(rest):
     _legacy_grants(rest, 2)
-    rest.identity_down = True
+    rest.members = [CREATOR]
+    rest.bulk_fail_on = 1
+
+    def down(issuer, tid, oid):
+        rest.subject_calls.append((issuer, tid, oid))
+        raise ConnectionError("down")
+
+    rest.monkeypatch.setattr(StubAuth, "get_user_by_idp_subject", staticmethod(down), raising=False)
     assert all(row["subject"]["user"] is None for row in rest.list_grants(limit=20)[0]["rows"])
-    rest.identity_down = False
+    rest.bulk_fail_on = None
+    _single_lookups_answer(rest)
+    rest.subject_calls.clear()
     assert all(row["subject"]["user"] for row in rest.list_grants(limit=20)[0]["rows"])
+    assert len(rest.bulk_calls) == 2 and rest.subject_calls == []   # the bulk call is made again, no single lookup is needed
+
+
+@pytest.mark.parametrize("mode", ["error", "non_dict"])
+def test_a_bulk_handler_that_refuses_or_answers_badly_sends_the_page_to_the_single_lookups_without_a_memory(rest, mode):
+    queries = rest.gov.module("utils.credential_queries")
+    _legacy_grants(rest, 3)
+    rest.bulk_mode = mode
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert all(row["subject"]["user"] for row in rows) and len(rest.subject_calls) == 3
+    assert queries._BULK["unavailable_until"] == 0.0
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")
+    rest.list_grants(limit=20)
+    assert len(rest.bulk_calls) == 2   # tried again
+
+
+def test_an_answer_for_somebody_else_is_not_trusted(rest):
+    _legacy_grants(rest, 2)
+    rest.members = [CREATOR]
+    rest.bulk_mode = "wrong_user"   # both keys answered with the record of the creator
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert all(row["subject"]["user"] is None for row in rows)
+    assert rest.gov.db.execute(P1, "SELECT subject_user_id FROM tenant.credential_use_grant")[0]["subject_user_id"] is None
+
+
+def test_two_issuers_on_one_page_are_two_bulk_calls_and_everyone_is_named(rest):
+    rest.users[APPROVER] = {**rest.users[APPROVER], "idp_tid": "t2", "idp_issuer": "https://issuer2.test"}   # on the page
+    _legacy_grants(rest, 4, tenant=lambda n: ("t1", "https://issuer.test") if n % 2 == 0 else ("t2", "https://issuer2.test"),
+                   actor=lambda n: None if n % 2 == 0 else APPROVER)   # the operators of the page show both issuers
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert {row["subject"]["user"]["email"] for row in rows} == {f"legacy{n}@x.test" for n in range(4)}
+    assert sorted((issuer, len(pairs)) for issuer, pairs in rest.bulk_calls) == [
+        ("https://issuer.test", 2), ("https://issuer2.test", 2)]
+    assert rest.subject_calls == [] and rest.member_calls == 0
+
+
+def test_subjects_of_a_tenant_with_no_known_issuer_go_to_the_member_list_and_are_not_dropped(rest):
+    _legacy_grants(rest, 3, tenant=lambda n: ("t1", "https://issuer.test") if n == 0 else ("t9", "https://issuer9.test"))
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert {row["subject"]["user"]["email"] for row in rows} == {f"legacy{n}@x.test" for n in range(3)}
+    assert [(issuer, pairs) for issuer, pairs in rest.bulk_calls] == [("https://issuer.test", [("t1", "legacy0")])]
+    assert rest.member_calls == 1 and rest.subject_calls == []
+
+
+def test_the_bulk_call_is_made_with_the_rpc_timeout_of_the_other_auth_proxies(rest):
+    _legacy_grants(rest, 2)
+    rest.list_grants(limit=20)
+    assert rest.bulk_timeouts == [15]
 
 
 def test_a_mandate_grant_needs_no_user(rest):
