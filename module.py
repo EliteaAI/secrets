@@ -86,6 +86,7 @@ class Module(module.ModuleModel):
                 (credential_api.MANAGE, credential_api.OPERATE_ROLES),
                 (credential_api.PROBE, credential_api.OPERATE_ROLES),
                 (credential_api.APPROVE, credential_api.OPERATE_ROLES),
+                (credential_api.SET_OWN_VALUE, credential_api.OWN_VALUE_ROLES),
                 ("credentials.use", {
                     "administration": {"admin": True, "viewer": False, "editor": False},
                     "default": {"admin": True, "viewer": True, "editor": True}}),
@@ -140,17 +141,23 @@ class Module(module.ModuleModel):
         def _run():
             try:
                 from .utils.credential_schema import (  # pylint: disable=C0415
-                    apply_credential_tables, project_ids_missing_credential_tables,
+                    apply_credential_tables, apply_written_by, project_ids_missing_credential_tables,
+                    project_ids_missing_written_by,
                 )
                 pending = project_ids_missing_credential_tables()
-                if not pending:
-                    return
-                log.info("credential governance schema: auto-migrating %s project(s)", len(pending))
-                migrated, failed = apply_credential_tables(pending)
-                log.info(
-                    "credential governance schema: auto-migration done (migrated=%s failed=%s)",
-                    len(migrated), len(failed),
-                )
+                if pending:
+                    log.info("credential governance schema: auto-migrating %s project(s)", len(pending))
+                    migrated, failed = apply_credential_tables(pending)
+                    log.info(
+                        "credential governance schema: auto-migration done (migrated=%s failed=%s)",
+                        len(migrated), len(failed),
+                    )
+                # the model reads written_by (#7119); adding the column is additive, the index swap is the task's
+                unwritten = project_ids_missing_written_by()
+                if unwritten:
+                    migrated, failed = apply_written_by(unwritten)
+                    log.info("credential governance schema: written_by added (migrated=%s failed=%s)",
+                             len(migrated), len(failed))
             except Exception:  # pylint: disable=W0703
                 log.exception("credential governance schema: auto-migration failed")
 

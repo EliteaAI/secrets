@@ -159,7 +159,8 @@ def patch_schema(gov, schema, monkeypatch):
 def test_the_task_creates_the_missing_tables_everywhere(tasks, patch_schema):
     module = Module()
     result = tasks.create_credential_governance_tables(module, param="project_id=all")
-    assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False}
+    assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False,
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
     assert patch_schema.applied == [([1, 2, 5], False)] and module.listed == [{"create_success": True}]
 
 
@@ -260,7 +261,7 @@ def test_init_loads_the_methods_and_registers_the_credential_permissions(plugin)
     permissions = {entry["permissions"][0]: entry["recommended_roles"] for entry in plugin.registered
                    if entry["permissions"][0].startswith("credentials.")}
     assert sorted(permissions) == ["credentials.approve", "credentials.manage", "credentials.probe",
-                                   "credentials.reveal", "credentials.use", "credentials.view"]
+                                   "credentials.reveal", "credentials.set_own_value", "credentials.use", "credentials.view"]
     assert permissions["credentials.use"]["default"] == {"admin": True, "viewer": True, "editor": True}
     for name in ("credentials.manage", "credentials.probe", "credentials.approve"):
         # what the role model grants after its defaults: operators only, never the system role
@@ -291,7 +292,8 @@ def test_a_registered_task_runs_the_method_on_the_module(gov, plugin, monkeypatc
     plugin.module.ready()
     monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_credential_tables", lambda: [])
     result = gov.admin.tasks["create_credential_governance_tables"](param="project_id=7;dry_run")
-    assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True}
+    assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True,
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
 
 
 def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
@@ -301,10 +303,13 @@ def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
     assert gov.admin.tasks == {}
 
 
-def run_guard(plugin, monkeypatch, gov, pending, apply=None):
+def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=()):
     monkeypatch.setattr(plugin.file, "Thread", lambda target, daemon: types.SimpleNamespace(start=target))
     schema = gov.module("utils.credential_schema")
     applied = []
+    plugin.written = []
+    monkeypatch.setattr(schema, "project_ids_missing_written_by", lambda: list(unwritten))
+    monkeypatch.setattr(schema, "apply_written_by", lambda ids: plugin.written.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_credential_tables",
                         pending if callable(pending) else (lambda: list(pending)))
     monkeypatch.setattr(schema, "apply_credential_tables", apply or (lambda ids: applied.append(list(ids)) or (ids, [])))
@@ -321,3 +326,9 @@ def test_a_failing_startup_guard_never_raises(gov, plugin, monkeypatch):
     def boom():
         raise RuntimeError("catalog down")
     assert run_guard(plugin, monkeypatch, gov, boom) == []
+
+
+def test_the_startup_guard_adds_the_written_by_column_where_it_is_missing(gov, plugin, monkeypatch):
+    assert run_guard(plugin, monkeypatch, gov, [], unwritten=[3, 9]) == [] and plugin.written == [[3, 9]]
+    assert run_guard(plugin, monkeypatch, gov, [4], unwritten=[]) == [[4]] and plugin.written == []   # tables first
+    assert run_guard(plugin, monkeypatch, gov, [], unwritten=[]) == [] and plugin.written == []        # steady state

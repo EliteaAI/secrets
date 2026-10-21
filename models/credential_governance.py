@@ -29,11 +29,14 @@ SUBJECT_KINDS = ('user_delegation', 'mandate')
 GRANT_STATES = ('pending_approval', 'active', 'suspended', 'revoked')
 LEDGER_OPS = ('write', 'delete_all')
 LEDGER_STATES = ('intent', 'written', 'committed', 'abandoned')
+LEGACY_INDEX = 'uq_credential_reference_live_configuration'
+SHARED_INDEX = 'uq_credential_reference_live_shared'
+PERSONAL_INDEX = 'uq_credential_reference_live_personal'
 
 # Columns that never change after the row exists (approved_by is set once, see _ONCE)
 REFERENCE_IMMUTABLE = frozenset({
     'id', 'project_id', 'configuration_id', 'configuration_uuid', 'provider', 'auth_mode', 'ownership_class',
-    'target_ref', 'environment', 'store_kind', 'created_by',
+    'custodian_ref', 'target_ref', 'environment', 'store_kind', 'created_by',
 })
 GRANT_IMMUTABLE = frozenset({
     'id', 'project_id', 'application_id', 'subject_kind', 'subject_ref', 'agent_binding_ref',
@@ -65,8 +68,13 @@ class CredentialReference(db_tools.AbstractBaseMixin, db.Base):
             "AND generation >= 1 AND validated_generation = generation)",
             name='credential_reference_active_ck'),
         CheckConstraint('approved_by IS NULL OR approved_by <> created_by', name='credential_reference_approver_ck'),
-        Index('uq_credential_reference_live_configuration', 'configuration_id', unique=True,
-              postgresql_where=text("state <> 'retired'")),
+        # One live reference per configuration for every class but personal, and one personal reference per owner of
+        # the configuration (#7119). Projects created before the personal class carry the single
+        # ``uq_credential_reference_live_configuration`` index until ``create_credential_governance_tables`` swaps it.
+        Index(SHARED_INDEX, 'configuration_id', unique=True,
+              postgresql_where=text("state <> 'retired' AND ownership_class <> 'personal'")),
+        Index(PERSONAL_INDEX, 'configuration_id', text("(custodian_ref->>'subject_ref')"), unique=True,
+              postgresql_where=text("state <> 'retired' AND ownership_class = 'personal'")),
         {'schema': c.POSTGRES_TENANT_SCHEMA},
     )
 
@@ -96,6 +104,8 @@ class CredentialReference(db_tools.AbstractBaseMixin, db.Base):
     policy_revision: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_by: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # whoever committed the current generation (an import or a personal value); never the one who approves it
+    written_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     state_changed_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     revocation_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default='0')
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -186,7 +186,7 @@ def normalized(events):
 
 REFERENCE_ROW_KEYS = {
     "id", "configuration", "provider", "ownership_class", "owner", "store_kind", "state", "generation", "validated",
-    "configuration_changed", "approval_ref", "policy_revision", "created_by", "approved_by", "expires_at",
+    "configuration_changed", "approval_ref", "policy_revision", "created_by", "approved_by", "written_by", "expires_at",
     "created_at", "updated_at"}
 GRANT_ROW_KEYS = {
     "id", "binding", "toolkit", "credential", "subject", "state", "valid_from", "valid_until", "approval_ref",
@@ -216,7 +216,7 @@ def test_the_grant_task_is_parse_then_run_and_keeps_its_outputs(rest):
     created = rest.grants.manage_grant(param, CREATOR)
     assert created == {"action": "create", "grant": created["grant"], "state": "pending_approval", "dry_run": False}
     assert rest.grants.manage_grant(param.replace("create", "approve") + ";approval_ref=A;policy_revision=B", CREATOR) == {
-        "error": "SELF_APPROVAL: The creator of a record cannot approve it.", "code": "SELF_APPROVAL"}
+        "error": "SELF_APPROVAL: The creator of a record, or whoever wrote its value, cannot approve it.", "code": "SELF_APPROVAL"}
     assert rest.grants.manage_grant("nonsense", CREATOR)["error"].startswith("unknown parameter")
 
 
@@ -639,7 +639,9 @@ def test_every_endpoint_declares_its_permissions_and_the_operator_roles(rest, mo
     if permissions == ["credentials.view"]:
         assert not any(effective["default"].values())  # the project mode does not see these endpoints at all
     handler = rest.mods[module]
-    assert list(handler.API.mode_handlers) == ["administration"] and handler.API.mode_handlers["administration"] is handler.AdminAPI
+    assert handler.API.mode_handlers["administration"] is handler.AdminAPI
+    # only the owner's own list has a default-mode handler here (#7119 PR 6); the rest is for operators
+    assert set(handler.API.mode_handlers) == ({"administration", "default"} if module == "credential_references" else {"administration"})
 
 
 def test_the_route_shapes_match_the_design(rest):
@@ -720,13 +722,13 @@ def test_a_call_without_a_signed_in_user_is_refused_and_writes_nothing(rest):
 def test_the_creator_cannot_approve_a_reference_or_a_grant(rest):
     ref = rest.new_ref(P1, until="validated")
     reply = rest.approve_ref(ref, actor=CREATOR)
-    assert reply == ({"error": "The creator of a record cannot approve it.", "code": "SELF_APPROVAL"}, 403)
+    assert reply == ({"error": "The creator of a record, or whoever wrote its value, cannot approve it.", "code": "SELF_APPROVAL"}, 403)
     assert rest.gov.reference(P1, uuid.UUID(ref)).approved_by is None
     rest.approve_ref(ref)
     rest.ref_action(ref, "activate")
     grant = rest.create_grant(rest.seed_binding(), ref)[0]["id"]
     again = rest.grant_action(grant, "approve", actor=CREATOR, approval_ref="A", policy_revision="B")
-    assert again == ({"error": "The creator of a record cannot approve it.", "code": "SELF_APPROVAL"}, 403)
+    assert again == ({"error": "The creator of a record, or whoever wrote its value, cannot approve it.", "code": "SELF_APPROVAL"}, 403)
     assert rest.gov.grant(P1, uuid.UUID(grant)).state == "pending_approval"
 
 

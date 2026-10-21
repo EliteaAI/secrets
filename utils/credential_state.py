@@ -8,7 +8,7 @@ after the change. No function here commits: the caller owns the transaction, so 
 (audit events, ledger rows) land with the change. False means the row is not in the expected state
 any more (another writer won) or does not exist; the caller reads it again.
 """
-from sqlalchemy import func, update
+from sqlalchemy import func, or_, update
 
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger, CredentialUseGrant
 
@@ -22,6 +22,9 @@ GRANT_TRANSITIONS = frozenset({
     ("pending_approval", "revoked"), ("active", "revoked"), ("suspended", "revoked"),
 })
 BUMPS_EPOCH = frozenset({"suspended", "retired", "revoked"})
+# The states a new generation can be staged and committed in; ``suspended`` is the rotation path (suspend, write a new
+# value, probe, approve, activate: the grants keep the reference id)
+WRITABLE_STATES = ("pending", "validated", "suspended")
 MAX_REF_LENGTH = 128
 
 
@@ -96,7 +99,8 @@ def transition_grant(session, grant_id, expected: str, target: str, *, actor: in
 
 
 def approve_reference(session, ref_id, *, actor: int, approval_ref: str, policy_revision: str) -> bool:
-    """Record the approval of a validated reference (state unchanged). Only someone other than the creator."""
+    """Record the approval of a validated reference (state unchanged). Only someone other than its creator and the one
+    who wrote its current generation."""
     _require_actor(actor)
     _require_approval(approval_ref, policy_revision)
     model = CredentialReference
@@ -105,6 +109,7 @@ def approve_reference(session, ref_id, *, actor: int, approval_ref: str, policy_
         {"approved_by": actor, "approval_ref": approval_ref, "policy_revision": policy_revision,
          "state_changed_by": actor},
         model.state == "validated", model.approved_by.is_(None), model.created_by != actor,
+        or_(model.written_by.is_(None), model.written_by != actor),
     )
 
 
@@ -127,7 +132,7 @@ def claim_generation(session, ref_id, generation: int) -> bool:
     model = CredentialReference
     return _apply(
         session, model, ref_id, {"pending_generation": generation},
-        model.state.in_(("pending", "validated")), model.pending_generation.is_(None),
+        model.state.in_(WRITABLE_STATES), model.pending_generation.is_(None),
         model.generation == generation - 1,
     )
 
@@ -138,16 +143,18 @@ def release_generation(session, ref_id, generation: int) -> bool:
     return _apply(session, model, ref_id, {"pending_generation": None}, model.pending_generation == generation)
 
 
-def commit_generation(session, ref_id, generation: int, configuration_generation) -> bool:
+def commit_generation(session, ref_id, generation: int, configuration_generation, written_by=None) -> bool:
     """Make a staged write the committed generation (compare-and-set). A re-import of a validated reference
-    puts it back to pending and clears its approval: the new material has to be probed and approved again."""
+    puts it back to pending and clears its approval: the new material has to be probed and approved again (a suspended
+    one, whose value was rotated, becomes pending the same way). ``written_by`` is whoever wrote it; ``None`` when that
+    is not known (a write the reconciler rolls forward), and then the writer limit on approval does not apply."""
     model = CredentialReference
     return _apply(
         session, model, ref_id,
         {"generation": generation, "pending_generation": None, "configuration_generation": configuration_generation,
          "validated_generation": None, "approved_by": None, "approval_ref": None, "policy_revision": None,
-         "state": "pending"},
-        model.state.in_(("pending", "validated")), model.generation == generation - 1,
+         "state": "pending", "written_by": written_by},
+        model.state.in_(WRITABLE_STATES), model.generation == generation - 1,
         model.pending_generation == generation,
     )
 

@@ -41,7 +41,7 @@ _REF = CredentialReference
 _REFERENCE_COLUMNS = (
     _REF.id, _REF.configuration_uuid, _REF.configuration_generation, _REF.provider, _REF.ownership_class,
     _REF.custodian_ref, _REF.store_kind, _REF.state, _REF.generation, _REF.validated_generation, _REF.approval_ref,
-    _REF.policy_revision, _REF.created_by, _REF.approved_by, _REF.expires_at, _REF.created_at, _REF.updated_at,
+    _REF.policy_revision, _REF.created_by, _REF.approved_by, _REF.written_by, _REF.expires_at, _REF.created_at, _REF.updated_at,
 )
 _GRANT = CredentialUseGrant
 _GRANT_COLUMNS = (
@@ -158,7 +158,7 @@ def _owner_id(custodian_ref):
 
 def _present_references(project_id, rows):
     facts = _facts(project_id, [row.configuration_uuid for row in rows])
-    users, _ = _users({i for row in rows for i in (row.created_by, row.approved_by, _owner_id(row.custodian_ref))
+    users, _ = _users({i for row in rows for i in (row.created_by, row.approved_by, row.written_by, _owner_id(row.custodian_ref))
                        if i is not None})
     present = []
     for row in rows:
@@ -180,6 +180,7 @@ def _present_references(project_id, rows):
             "policy_revision": row.policy_revision,
             "created_by": _user(users, row.created_by),
             "approved_by": _user(users, row.approved_by),
+            "written_by": _user(users, row.written_by),
             "expires_at": _iso(row.expires_at),
             "created_at": _iso(row.created_at),
             "updated_at": _iso(row.updated_at),
@@ -216,6 +217,17 @@ def list_references(project_id, page, filters):
             select(*_REFERENCE_COLUMNS).where(*conditions).order_by(*_order(REFERENCE_SORTS, page, _REF))
             .limit(page.limit).offset(page.offset)).all()
     return {"total": total, "rows": _present_references(project_id, rows)}
+
+
+def reference_custody(project_id, ref_id):
+    """``(ownership_class, owner user id or None)`` of one reference of the project; a reference of another project is
+    ``REFERENCE_NOT_FOUND`` like an unknown one."""
+    with project_tx(project_id) as session:
+        row = session.execute(select(_REF.ownership_class, _REF.custodian_ref).where(
+            _REF.id == uuid.UUID(str(ref_id)), _REF.project_id == project_id)).first()
+    if row is None:
+        raise CredentialTaskError("REFERENCE_NOT_FOUND")
+    return row.ownership_class, _owner_id(row.custodian_ref)
 
 
 def reference_detail(project_id, ref_id):

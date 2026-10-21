@@ -20,6 +20,7 @@ from .credential_onboarding import _load, _store_ref
 
 RUN_STATES = frozenset({"active"})
 PROBE_STATES = frozenset({"validated", "active"})  # a probe of saved material precedes activation
+ONBOARDING_PROBE_STATES = frozenset({"pending", "validated", "active"})  # and a personal value is tried before it is validated
 
 
 def _refused(reason_code: str) -> dict:
@@ -27,7 +28,7 @@ def _refused(reason_code: str) -> dict:
 
 
 def release_material(  # pylint: disable=R0913
-    project_id, ref_id, generation, release_id, actor_ref, *, allow_validated=False,
+    project_id, ref_id, generation, release_id, actor_ref, *, allow_validated=False, allow_pending=False,
 ) -> dict:
     """``{"ok": True, "value": SecretValue}`` or ``{"ok": False, "reason_code": ...}``; ``ValueError`` (fixed
     message) for a malformed request. Reasons: ``CREDENTIAL_REFERENCE_INACTIVE`` (no such reference in this
@@ -47,7 +48,7 @@ def release_material(  # pylint: disable=R0913
     except Exception as exc:  # pylint: disable=W0703
         log.error("credential release: reference read failed (%s)", type(exc).__name__)
         return _refused("DEPENDENCY_UNAVAILABLE")
-    if ref.state not in (PROBE_STATES if allow_validated else RUN_STATES):
+    if ref.state not in (ONBOARDING_PROBE_STATES if allow_pending else PROBE_STATES if allow_validated else RUN_STATES):
         return _refused("CREDENTIAL_REFERENCE_INACTIVE")
     if ref.generation != generation:
         return _refused("CREDENTIAL_GENERATION_MISMATCH")

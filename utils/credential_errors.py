@@ -5,7 +5,7 @@ value from the caller, so a message can never carry a path, a secret or a store 
 """
 MESSAGES = {
     "ACTOR_REQUIRED": "This action needs an identified operator.",
-    "SELF_APPROVAL": "The creator of a record cannot approve it.",
+    "SELF_APPROVAL": "The creator of a record, or whoever wrote its value, cannot approve it.",
     "APPROVAL_REQUIRED": "Approval needs an approval reference and a policy revision.",
     "INVALID_STATE": "The record is not in a state this action can start from.",
     "CONCURRENT_CHANGE": "The record changed while this ran; read it again and retry.",
@@ -28,6 +28,17 @@ MESSAGES = {
     "UNSUPPORTED_STORE_KIND": "This store kind cannot be used for credential references.",
     "UNSUPPORTED_OWNERSHIP_CLASS": "This ownership class cannot be registered for governed use.",
     "DEPENDENCY_UNAVAILABLE": "A required service is unavailable; nothing was changed.",
+    # personal references (#7119)
+    "MIGRATION_REQUIRED": "Personal credential references need a database update; run create_credential_governance_tables first.",
+    "OWNER_NOT_MEMBER": "The owner must be a member of the project.",
+    "OWNER_UNLINKED": "The owner has no linked identity-provider subject.",
+    "PERSONAL_ONLY": "A value can be written to a personal credential reference only.",
+    "USE_PERSONAL_VALUE": "A personal credential takes its value through the value endpoint, not through an import.",
+    "SUBJECT_NOT_OWNER": "A personal credential can be granted only to its owner.",
+    "CHECK_CONNECTION_FAILED": "The provider did not accept the stored credential.",
+    "CHECK_CONNECTION_REFUSED": "The connection check could not be run for this credential.",
+    "DENIED_RBAC": "You do not have permission to test saved credentials.",
+    "OWNER_ONLY": "Only the owner of a personal credential can set its value.",
     # REST API only (#7119)
     "INVALID_REQUEST": "The request is not valid.",
     "REQUEST_TOO_LARGE": "The request is too large.",

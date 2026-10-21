@@ -3,16 +3,26 @@
 ``create_all`` provisions them for new projects. Existing project schemas get them here, from the
 startup safety net in ``module.py`` or from the ``create_credential_governance_tables`` admin task.
 Both only create what is missing, so a steady-state boot issues no DDL.
+
+Personal credential references (#7119) need two changes to a project that predates them, applied by the
+``personal_index`` step of the task: the single live-reference unique index becomes a shared and a personal pair, and
+``credential_reference.written_by`` is added (also by the startup safety net, since the model reads it). The step takes
+``lock_timeout`` 5 s on PostgreSQL: a project whose table is busy fails alone and is reported, and the step is repeated.
 """
 from contextlib import contextmanager
 
+import sqlalchemy as sa
 from sqlalchemy import bindparam, text
 from pylon.core.tools import log
-from tools import db
+from tools import config as c, db
 
-from ..models.credential_governance import CredentialReference, CredentialStoreLedger, CredentialUseGrant
+from ..models.credential_governance import (
+    LEGACY_INDEX, PERSONAL_INDEX, SHARED_INDEX, CredentialReference, CredentialStoreLedger, CredentialUseGrant,
+)
 
 _MODELS = (CredentialReference, CredentialUseGrant, CredentialStoreLedger)
+LOCK_TIMEOUT = "5s"
+WRITTEN_BY = "written_by"
 USAGE = "project_id= is required. Format: project_id=<all|N>[;dry_run]"
 
 # Only fully provisioned project schemas (they already hold the configuration table) are considered.
@@ -22,6 +32,87 @@ _MISSING_QUERY = text(
     "AND (SELECT count(*) FROM information_schema.tables x "
     "WHERE x.table_schema = t.table_schema AND x.table_name IN :names) < :expected"
 ).bindparams(bindparam("names", expanding=True))
+
+
+# Project schemas that have credential_reference but not its written_by column (one catalog query)
+_MISSING_COLUMN_QUERY = text(
+    "SELECT t.table_schema FROM information_schema.tables t "
+    "WHERE t.table_name = 'credential_reference' AND t.table_schema ~ '^p_[0-9]+$' "
+    "AND NOT EXISTS (SELECT 1 FROM information_schema.columns x WHERE x.table_schema = t.table_schema "
+    "AND x.table_name = 'credential_reference' AND x.column_name = 'written_by')")
+
+
+def _new_indexes():
+    by_name = {index.name: index for index in CredentialReference.__table__.indexes}
+    return by_name[SHARED_INDEX], by_name[PERSONAL_INDEX]
+
+
+def _legacy_index():
+    """The pre-personal single index, as a drop target: a table of its own, so the model's metadata is not touched."""
+    table = sa.Table("credential_reference", sa.MetaData(), sa.Column("configuration_id", sa.Integer),
+                     schema=c.POSTGRES_TENANT_SCHEMA)
+    return sa.Index(LEGACY_INDEX, table.c.configuration_id)
+
+
+def _table_exists(session) -> bool:
+    connection = session.connection()
+    table = CredentialReference.__table__
+    return sa.inspect(connection).has_table(table.name, schema=connection.schema_for_object(table))
+
+
+def _index_names(session) -> set:
+    """The names of the indexes on the project's ``credential_reference``, read from the catalog (reflection skips the
+    expression index of the personal pair on some dialects). PostgreSQL in production; SQLite in the unit tests."""
+    connection = session.connection()
+    table = CredentialReference.__table__
+    if connection.dialect.name == "postgresql":
+        rows = connection.execute(
+            text("SELECT indexname FROM pg_indexes WHERE schemaname = :schema AND tablename = :table"),
+            {"schema": connection.schema_for_object(table), "table": table.name})
+    else:
+        rows = connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :table"), {"table": table.name})
+    return {row[0] for row in rows}
+
+
+def _column_names(session) -> set:
+    """The column names of the project's ``credential_reference`` (the catalog, as for the indexes)."""
+    connection = session.connection()
+    table = CredentialReference.__table__
+    if connection.dialect.name == "postgresql":
+        rows = connection.execute(
+            text("SELECT column_name FROM information_schema.columns WHERE table_schema = :schema AND table_name = :table"),
+            {"schema": connection.schema_for_object(table), "table": table.name})
+        return {row[0] for row in rows}
+    return {row[1] for row in connection.execute(text(f'PRAGMA table_info("{table.name}")'))}
+
+
+def personal_index_applied(session) -> bool:
+    """True when this project's ``credential_reference`` has the two partial indexes that allow personal references and
+    no longer has the single index they replace (which would keep allowing one reference per configuration)."""
+    names = _index_names(session)
+    return {SHARED_INDEX, PERSONAL_INDEX} <= names and LEGACY_INDEX not in names
+
+
+def personal_schema_applied(session) -> bool:
+    """The whole ``personal_index`` step is done: the indexes and the ``written_by`` column."""
+    return personal_index_applied(session) and WRITTEN_BY in _column_names(session)
+
+
+def _set_lock_timeout(connection):
+    """Bound the wait for a lock on the table to ``LOCK_TIMEOUT`` for this transaction (PostgreSQL only)."""
+    if connection.dialect.name == "postgresql":
+        connection.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+
+
+def _add_written_by(connection, present_columns):
+    if WRITTEN_BY in present_columns:
+        return
+    table = CredentialReference.__table__
+    preparer = connection.dialect.identifier_preparer
+    schema = connection.schema_for_object(table)
+    name = f"{preparer.quote_schema(schema)}.{preparer.quote(table.name)}" if schema else preparer.quote(table.name)
+    connection.execute(text(f"ALTER TABLE {name} ADD COLUMN {WRITTEN_BY} INTEGER"))
 
 
 @contextmanager
@@ -59,6 +150,71 @@ def apply_credential_tables(project_ids, dry_run=False):
             migrated.append(pid)
         except Exception:  # pylint: disable=W0703
             log.exception("credential governance schema: failed to migrate project %s", pid)
+            failed.append({"project_id": pid})
+    return migrated, failed
+
+
+def project_ids_missing_personal_index(project_ids):
+    """The projects among ``project_ids`` whose ``credential_reference`` exists but lacks a part of the
+    ``personal_index`` step (the index pair, or ``written_by``); one catalog read per project."""
+    pending = []
+    for pid in project_ids:
+        with project_tx(pid) as session:
+            if _table_exists(session) and not personal_schema_applied(session):
+                pending.append(pid)
+    return pending
+
+
+def project_ids_missing_written_by():
+    """One catalog query: project schemas whose ``credential_reference`` has no ``written_by`` column yet."""
+    with db.get_session(None) as session:
+        rows = session.execute(_MISSING_COLUMN_QUERY).fetchall()
+    return [int(row[0][2:]) for row in rows]
+
+
+def apply_written_by(project_ids):
+    """Add ``written_by`` where it is missing (additive and idempotent; the startup safety net runs it, since the model
+    reads the column). Returns ``(migrated, failed)``."""
+    migrated, failed = [], []
+    for pid in project_ids:
+        try:
+            with db.get_session(pid) as session:
+                connection = session.connection()
+                _set_lock_timeout(connection)
+                _add_written_by(connection, _column_names(session))
+                session.commit()
+            migrated.append(pid)
+        except Exception:  # pylint: disable=W0703
+            log.exception("credential governance schema: failed to add written_by to project %s", pid)
+            failed.append({"project_id": pid})
+    return migrated, failed
+
+
+def apply_personal_index(project_ids, dry_run=False):
+    """Swap the one live-reference index for the shared and personal pair and add ``written_by`` (``personal_index``
+    step), one transaction per project (DDL is transactional on PostgreSQL, so a project is never left without a unique
+    index) that waits at most ``LOCK_TIMEOUT`` for the table: a timeout fails that project alone. Existing rows are all
+    non-personal, so both new indexes build over data the old one already kept unique. Returns ``(migrated, failed)``
+    like ``apply_credential_tables``."""
+    migrated, failed = [], []
+    for pid in project_ids:
+        if dry_run:
+            migrated.append(pid)
+            continue
+        try:
+            with db.get_session(pid) as session:
+                connection = session.connection()
+                _set_lock_timeout(connection)
+                present = _index_names(session)
+                _add_written_by(connection, _column_names(session))
+                connection.execute(sa.schema.DropIndex(_legacy_index(), if_exists=True))
+                for index in _new_indexes():
+                    if index.name not in present:
+                        index.create(connection)
+                session.commit()
+            migrated.append(pid)
+        except Exception:  # pylint: disable=W0703
+            log.exception("credential governance schema: failed to apply the personal index to project %s", pid)
             failed.append({"project_id": pid})
     return migrated, failed
 

@@ -28,7 +28,7 @@ def test_references_are_keyed_by_configuration_id_with_the_documented_shape(gov,
     assert result == {"references": {row.configuration_id: {
         "ref_id": str(ref_id), "state": "active", "generation": 1, "configuration_generation": 4,
         "store_kind": "corporate_vault", "ownership_class": "service", "revocation_epoch": 2,
-        "custodian_user_id": None}}, "grants": {}}
+        "custodian_user_id": None, "custodian_subject_ref": None}}, "grants": {}}
 
 
 def test_ref_ids_find_the_same_rows_and_the_selectors_combine(gov, facts):
@@ -160,8 +160,8 @@ def test_the_answer_has_no_locator_secret_or_store_path(gov, facts):
 
 def test_the_facts_version_is_exported_where_a_startup_check_can_read_it(gov, facts):
     _, method = facts
-    assert method.CREDENTIAL_FACTS_VERSION == 2 == method.Method.CREDENTIAL_FACTS_VERSION
-    assert method.Method.credential_facts_version(object()) == 2
+    assert method.CREDENTIAL_FACTS_VERSION == 3 == method.Method.CREDENTIAL_FACTS_VERSION
+    assert method.Method.credential_facts_version(object()) == 3
 
 
 def test_grant_facts_carry_the_subject_kind_for_both_kinds(gov, facts):

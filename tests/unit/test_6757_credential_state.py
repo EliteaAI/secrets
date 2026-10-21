@@ -27,7 +27,7 @@ GRANT_ALLOWED = {
     ("pending_approval", "revoked"), ("active", "revoked"), ("suspended", "revoked"),
 }
 ENTERING_REVOKED = {"suspended", "retired", "revoked"}
-CREATOR, APPROVER, OPERATOR = 10, 20, 7
+CREATOR, APPROVER, OPERATOR, WRITER = 10, 20, 7, 11
 
 
 @pytest.fixture
@@ -218,6 +218,16 @@ def test_the_creator_cannot_approve(gov, st):
     assert gov.grant(1, grant_id).state == "pending_approval"
 
 
+def test_whoever_wrote_the_current_generation_cannot_approve_it_either(gov, st):
+    ref_id = prepared_reference(gov, "validated", approved_by=None, approval_ref=None, policy_revision=None,
+                                written_by=WRITER)
+    assert approve(gov, st, ref_id, actor=WRITER) is False
+    assert gov.reference(1, ref_id).approved_by is None
+    assert approve(gov, st, ref_id, actor=APPROVER) is True   # anyone else may
+    unknown = prepared_reference(gov, "validated", approved_by=None, approval_ref=None, policy_revision=None)
+    assert approve(gov, st, unknown, actor=WRITER) is True    # a write whose author is not known limits no one
+
+
 def test_only_a_validated_reference_can_be_approved_and_only_once(gov, st):
     pending = prepared_reference(gov, "pending")
     assert approve(gov, st, pending) is False
@@ -337,10 +347,14 @@ def test_the_tables_compile_for_postgresql_in_the_tenant_schema(models):
     for table in (models.CredentialReference, models.CredentialUseGrant, models.CredentialStoreLedger):
         ddl = str(CreateTable(table.__table__).compile(dialect=dialect))
         assert f"CREATE TABLE tenant.{table.__tablename__}" in ddl
-    index = next(i for i in models.CredentialReference.__table__.indexes
-                 if i.name == "uq_credential_reference_live_configuration")
-    ddl = str(CreateIndex(index).compile(dialect=dialect))
-    assert "UNIQUE INDEX" in ddl and "WHERE state <> 'retired'" in ddl
+    indexes = {i.name: i for i in models.CredentialReference.__table__.indexes}
+    assert "uq_credential_reference_live_configuration" not in indexes   # replaced by the pair below (#7119)
+    shared = str(CreateIndex(indexes["uq_credential_reference_live_shared"]).compile(dialect=dialect))
+    assert "UNIQUE INDEX" in shared and "(configuration_id)" in shared
+    assert "WHERE state <> 'retired' AND ownership_class <> 'personal'" in shared
+    personal = str(CreateIndex(indexes["uq_credential_reference_live_personal"]).compile(dialect=dialect))
+    assert "UNIQUE INDEX" in personal and "(configuration_id, (custodian_ref->>'subject_ref'))" in personal
+    assert "WHERE state <> 'retired' AND ownership_class = 'personal'" in personal
 
 
 # --- generation compare-and-set -----------------------------------------------------------------------------------
@@ -352,9 +366,9 @@ def claim(gov, st, ref_id, generation):
         return done
 
 
-def commit(gov, st, ref_id, generation, configuration_generation=4):
+def commit(gov, st, ref_id, generation, configuration_generation=4, written_by=None):
     with session_for(gov) as session:
-        done = st.commit_generation(session, ref_id, generation, configuration_generation)
+        done = st.commit_generation(session, ref_id, generation, configuration_generation, written_by=written_by)
         session.commit()
         return done
 
@@ -372,10 +386,20 @@ def test_a_claim_must_be_the_next_generation(gov, st, generation):
     assert claim(gov, st, ref_id, generation) is False
 
 
-@pytest.mark.parametrize("state", ["active", "suspended", "retired"])
-def test_a_claim_is_refused_outside_pending_and_validated(gov, st, state):
+@pytest.mark.parametrize("state", ["active", "retired"])
+def test_a_claim_is_refused_outside_pending_validated_and_suspended(gov, st, state):
     ref_id = gov.add_reference(state=state, generation=1)
     assert claim(gov, st, ref_id, 2) is False
+
+
+def test_a_suspended_reference_can_be_given_a_new_value_and_comes_back_pending(gov, st):
+    """The rotation path (#7119): suspend, write, probe, approve, activate. The reference id, and so its grants, stay."""
+    ref_id = gov.add_reference(state="suspended", generation=1, revocation_epoch=3)
+    assert claim(gov, st, ref_id, 2) is True
+    assert commit(gov, st, ref_id, 2, written_by=WRITER) is True
+    row = gov.reference(1, ref_id)
+    assert (row.state, row.generation, row.validated_generation, row.approved_by, row.written_by, row.revocation_epoch) == (
+        "pending", 2, None, None, WRITER, 3)
 
 
 def test_a_released_claim_can_be_taken_again(gov, st):
@@ -426,7 +450,7 @@ def test_committing_over_a_validated_reference_sends_it_back_to_pending_and_drop
             row.policy_revision) == ("pending", 2, None, None, None, None)
 
 
-@pytest.mark.parametrize("state", ["active", "suspended", "retired"])
+@pytest.mark.parametrize("state", ["active", "retired"])
 def test_committing_never_touches_a_reference_in_use_or_retired(gov, st, state):
     ref_id = gov.add_reference(state=state, generation=1, pending_generation=2)
     assert commit(gov, st, ref_id, 2) is False
@@ -439,7 +463,7 @@ REFERENCE_NEW_VALUES = {
     "id": lambda: uuid.uuid4(), "project_id": lambda: 99, "configuration_id": lambda: 99,
     "configuration_uuid": lambda: uuid.uuid4(), "provider": lambda: "other", "auth_mode": lambda: "oauth",
     "ownership_class": lambda: "service", "target_ref": lambda: "t", "environment": lambda: "prod",
-    "store_kind": lambda: "corporate_vault", "created_by": lambda: 99,
+    "store_kind": lambda: "corporate_vault", "created_by": lambda: 99, "custodian_ref": lambda: {"user_id": 99},
 }
 GRANT_NEW_VALUES = {
     "id": lambda: uuid.uuid4(), "project_id": lambda: 99, "application_id": lambda: 99,
@@ -480,7 +504,7 @@ def test_the_mutable_columns_still_change_and_a_no_op_write_is_not_a_change(gov,
     ref_id = gov.add_reference()
     with session_for(gov) as session:
         row = session.get(models.CredentialReference, ref_id)
-        row.state, row.generation, row.custodian_ref, row.store_locator = "validated", 3, {"user_id": 1}, {"x": 1}
+        row.state, row.generation, row.written_by, row.store_locator = "validated", 3, 77, {"x": 1}
         row.provider = row.provider  # same value
         session.commit()
     assert gov.reference(1, ref_id).generation == 3

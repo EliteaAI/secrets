@@ -11,6 +11,10 @@ material never travels in a task parameter, a result, a log line or an event. Th
 where it is until the release path moves to the store. The store write happens outside any
 transaction, between three short ones (stake the generation, mark the ledger written, commit the
 generation), so a crash at any point leaves a ledger row ``reconcile_credential_store`` settles.
+
+A ``personal`` reference belongs to one project member (``custodian_ref``: the user id and the identity-provider
+subject, resolved on the server). It has no import: its value is written through ``credential_material`` (the same
+staged write), and its probe checks the store and, on request, the connection (#7119).
 """
 import hashlib
 import hmac
@@ -21,12 +25,13 @@ from types import SimpleNamespace
 from pylon.core.tools import log
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from tools import config as c, secret_stores, this
+from tools import auth, config as c, secret_stores, this
 
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger
 from . import credential_audit as audit
 from .credential_errors import CredentialTaskError, require_actor, store_error_result
-from .credential_schema import project_tx
+from .credential_queries import subject_ref_of_user
+from .credential_schema import personal_schema_applied, project_tx
 from .credential_state import (
     InvalidTransition, approve_reference, claim_generation, commit_generation, release_generation,
     set_ledger_state, transition_reference,
@@ -34,13 +39,15 @@ from .credential_state import (
 
 ACTIONS = ("create", "import", "probe", "approve", "activate", "suspend", "resume", "retire")
 ONBOARD_STORE_KINDS = ("database", "corporate_vault")
-ONBOARD_OWNERSHIP_CLASSES = ("project_shared", "service", "technical")
+ONBOARD_OWNERSHIP_CLASSES = ("project_shared", "service", "technical", "personal")
 USAGE = (
     "Format: project_id=N;action=<create|import|probe|approve|activate|suspend|resume|retire>;"
-    "configuration_uuid=U;store_kind=<database|corporate_vault>;ownership_class=<project_shared|service|technical> "
-    "(create) or ref=R (every other action)[;approval_ref=...;policy_revision=...] (approve)[;dry_run]"
+    "configuration_uuid=U;store_kind=<database|corporate_vault>;"
+    "ownership_class=<project_shared|service|technical|personal>[;owner_user_id=N] (create; the owner of a personal "
+    "reference) or ref=R (every other action)[;approval_ref=...;policy_revision=...] (approve)[;check_connection] "
+    "(probe of a personal reference)[;dry_run]"
 )
-INT_KEYS = ("project_id",)
+INT_KEYS = ("project_id", "owner_user_id")
 TEXT_KEYS = ("action", "configuration_uuid", "ref", "store_kind", "ownership_class", "approval_ref", "policy_revision")
 UUID_KEYS = ("configuration_uuid", "ref")
 # Store answers that prove the request was not carried out; anything else (a timeout) may have been
@@ -61,6 +68,9 @@ def parse_reference_param(param):
             continue
         if seg.lower() == "dry_run":
             values["dry_run"] = True
+            continue
+        if seg.lower() == "check_connection":
+            values["check_connection"] = True
             continue
         key, sep, value = seg.partition("=")
         key, value = key.strip().lower(), value.strip()
@@ -97,6 +107,12 @@ def parse_reference_param(param):
             return None, f"invalid store_kind: '{values['store_kind']}'"
         if values["ownership_class"] not in ONBOARD_OWNERSHIP_CLASSES:
             return None, f"invalid ownership_class: '{values['ownership_class']}'"
+        if (values["ownership_class"] == "personal") != ("owner_user_id" in values):
+            return None, f"owner_user_id goes with ownership_class=personal, and only with it. {USAGE}"
+    elif "owner_user_id" in values:
+        return None, "owner_user_id applies to create only"
+    if values.get("check_connection") and action != "probe":
+        return None, "check_connection applies to probe only"
     return values, None
 
 
@@ -168,6 +184,14 @@ def _mint(purpose, ref, correlation, actor):
         purpose, decision_id=correlation, actor_ref=audit.operator_ref(actor), project_id=ref.project_id, ref_id=ref.id)
 
 
+def write_to_store(ref, fields, generation, correlation, actor):
+    """Write ``fields`` (name -> SecretStr) to the reference's store as ``generation``, with check-and-set on the
+    previous one. The store writes live here, with the other custody calls; ``credential_material`` stages around it."""
+    return secret_stores.get_store(ref.store_kind, governed=True).write(
+        _store_ref(ref), secret_stores.SecretValue(fields, generation), expected_version=generation - 1,
+        ctx=_mint("onboard", ref, correlation, actor))
+
+
 def _open_ledger(session, ref, generation, op, correlation):
     """Record the intent to touch the store. A row left by an abandoned attempt is reused."""
     row = session.execute(select(CredentialStoreLedger).where(
@@ -185,9 +209,36 @@ def _open_ledger(session, ref, generation, op, correlation):
     return row.id
 
 
+def _custodian(ref):
+    custodian = getattr(ref, "custodian_ref", None)
+    return custodian if getattr(ref, "ownership_class", None) == "personal" and isinstance(custodian, dict) else {}
+
+
 def _event(reason_code, ref, actor, event_type="lifecycle", **fields):
+    """A personal reference's events name its owner (``user_ref``): the credential is attributed to that user."""
+    subject = _custodian(ref).get("subject_ref")
+    if subject:
+        fields.setdefault("user_ref", subject)
     return audit.build_event(
         event_type, reason_code, project_id=ref.project_id, actor_user_id=actor, credential_ref=ref.id, **fields)
+
+
+def _owner_custodian(project_id, owner_user_id) -> dict:
+    """``custodian_ref`` of a personal reference: the owner must be a member of the project, and the identity-provider
+    subject is resolved here, from the identity service (a caller never supplies it). Membership comes first, so the
+    answer does not tell whether a user exists."""
+    try:
+        members = {int(row["user_id"]) for row in auth.list_project_user_roles(project_id) or []}
+    except Exception:  # pylint: disable=W0703
+        raise CredentialTaskError("DEPENDENCY_UNAVAILABLE") from None
+    if owner_user_id not in members:
+        raise CredentialTaskError("OWNER_NOT_MEMBER")
+    try:
+        subject = subject_ref_of_user(owner_user_id)
+    except CredentialTaskError as exc:
+        raise CredentialTaskError(
+            "OWNER_UNLINKED" if exc.code in ("SUBJECT_UNLINKED", "SUBJECT_NOT_FOUND") else exc.code) from None
+    return {"user_id": owner_user_id, "subject_ref": subject}
 
 
 # --- actions -------------------------------------------------------------------------------------
@@ -200,18 +251,31 @@ def _create(values, actor):
     if facts.get("section") != "credentials" or facts.get("project_id") != project_id:
         raise CredentialTaskError("CONFIGURATION_NOT_ELIGIBLE")
     secret_stores.get_store(values["store_kind"], governed=True)  # a store that cannot be used is refused now
+    personal = values["ownership_class"] == "personal"
+    custodian = _owner_custodian(project_id, values["owner_user_id"]) if personal else None
+    live = select(CredentialReference.id).where(
+        CredentialReference.configuration_id == facts["id"], CredentialReference.state != "retired")
+    if personal:   # a personal reference stands beside the shared one; one per owner
+        live = live.where(CredentialReference.ownership_class == "personal",
+                          CredentialReference.custodian_ref["subject_ref"].as_string() == custodian["subject_ref"])
+    else:
+        live = live.where(CredentialReference.ownership_class != "personal")
     if values["dry_run"]:
+        if personal:
+            with project_tx(project_id) as session:
+                if not personal_schema_applied(session):
+                    raise CredentialTaskError("MIGRATION_REQUIRED")
         return {"dry_run": True, "action": "create", "state": "pending", "provider": facts["type"]}
     with project_tx(project_id) as session:
-        if session.execute(select(CredentialReference.id).where(
-                CredentialReference.configuration_id == facts["id"], CredentialReference.state != "retired",
-        )).first() is not None:
+        if personal and not personal_schema_applied(session):   # the old index would allow one reference per configuration
+            raise CredentialTaskError("MIGRATION_REQUIRED")
+        if session.execute(live).first() is not None:
             raise CredentialTaskError("REFERENCE_EXISTS")
         row = CredentialReference(
             project_id=project_id, configuration_id=facts["id"],
             configuration_uuid=uuid.UUID(values["configuration_uuid"]), provider=facts["type"],
-            auth_mode="static_secret", ownership_class=values["ownership_class"], store_kind=values["store_kind"],
-            store_locator=_locator(values["store_kind"]), generation=0,
+            auth_mode="static_secret", ownership_class=values["ownership_class"], custodian_ref=custodian,
+            store_kind=values["store_kind"], store_locator=_locator(values["store_kind"]), generation=0,
             state="pending", created_by=actor, state_changed_by=actor,
         )
         session.add(row)
@@ -230,6 +294,8 @@ def _import(values, actor):  # pylint: disable=R0914
     project_id = values["project_id"]
     with project_tx(project_id) as session:
         ref = _load(session, project_id, values["ref"])
+        if ref.ownership_class == "personal":   # the configuration holds the shared value, not this user's
+            raise CredentialTaskError("USE_PERSONAL_VALUE")
         if ref.state not in ("pending", "validated"):
             raise CredentialTaskError("INVALID_STATE")
         generation = ref.generation + 1
@@ -258,7 +324,7 @@ def _import(values, actor):  # pylint: disable=R0914
         set_ledger_state(session, ledger_id, ("intent",), "written")
         session.commit()
     with project_tx(project_id) as session:
-        if not commit_generation(session, ref.id, generation, bundle["configuration_generation"]):
+        if not commit_generation(session, ref.id, generation, bundle["configuration_generation"], written_by=actor):
             session.rollback()
             raise CredentialTaskError("CONCURRENT_CHANGE")
         set_ledger_state(session, ledger_id, ("intent", "written"), "committed")
@@ -284,11 +350,66 @@ def _import_failed(project_id, ref, generation, ledger_id, actor, exc):
     return store_error_result(exc) if is_store else exc.result()
 
 
-def _probe(values, actor):
+def _owner_check(project_id, ref):
+    """A personal value is not compared with the configuration's own (they differ by design); what must still hold is
+    that the configuration has not changed since the value was written."""
+    facts = _configuration_facts(project_id, str(ref.configuration_uuid))
+    if facts is None:
+        raise CredentialTaskError("CONFIGURATION_NOT_FOUND")
+    if facts.get("generation") != ref.configuration_generation:
+        raise CredentialTaskError("CONFIGURATION_CHANGED")
+
+
+def _probe_store(project_id, ref, ctx):
+    """The store checks of a probe. Returns the store's request id."""
+    store = secret_stores.get_store(ref.store_kind, governed=True)
+    sref = _store_ref(ref)
+    meta = store.metadata(sref, ctx)
+    request_id = getattr(meta, "request_id", None)
+    if ref.generation not in meta.versions:
+        raise secret_stores.StoreError("NOT_FOUND")
+    if ref.ownership_class == "personal":
+        _owner_check(project_id, ref)
+        return request_id
+    stored = store.read(sref, ref.generation, ctx)
+    current = _read_bundle(project_id, ref.configuration_id, ctx)
+    if not hmac.compare_digest(_digest(stored.fields), _digest(current["fields"])):
+        raise CredentialTaskError("MATERIAL_MISMATCH")
+    if current["configuration_generation"] != ref.configuration_generation:
+        raise CredentialTaskError("CONFIGURATION_CHANGED")
+    return request_id
+
+
+def _check_connection(project_id, ref, actor):
+    """Test a personal reference's stored value against its provider. The operator (``actor``, already authorised by the
+    REST layer) holds ``credentials.probe``; the personal reference probed is its custodian's. Raises
+    ``CHECK_CONNECTION_FAILED`` when the provider refuses the credential, ``DENIED_RBAC`` when the actor may not probe,
+    and ``CHECK_CONNECTION_REFUSED`` when the check could not run (worker, store, audit). The answer is a code only:
+    the provider's own text can echo what it was given."""
+    owner = (_custodian(ref) or {}).get("user_id")
+    try:
+        answer = this.for_module("elitea_core").module.governed_check_connection(
+            project_id, str(ref.configuration_uuid), ref.provider, owner, actor_user_id=actor, onboarding=True)
+    except Exception:  # pylint: disable=W0703
+        raise CredentialTaskError("CHECK_CONNECTION_REFUSED") from None
+    if not isinstance(answer, dict) or answer.get("requires_authorization") or answer.get("success") not in (True, False):
+        raise CredentialTaskError("CHECK_CONNECTION_REFUSED")
+    if answer["success"]:
+        return
+    if answer.get("code") == "DENIED_RBAC":
+        raise CredentialTaskError("DENIED_RBAC")
+    raise CredentialTaskError("CHECK_CONNECTION_REFUSED" if answer.get("code") else "CHECK_CONNECTION_FAILED")
+
+
+def _probe(values, actor):  # pylint: disable=R0914
     project_id = values["project_id"]
+    check = bool(values.get("check_connection"))
     with project_tx(project_id) as session:
         ref = _load(session, project_id, values["ref"])
-        if ref.state != "pending" or ref.generation < 1 or ref.pending_generation is not None:
+        if check and ref.ownership_class != "personal":
+            raise CredentialTaskError("INVALID_REQUEST")
+        if (ref.state not in (("pending", "validated", "active") if check else ("pending",)) or ref.generation < 1
+                or ref.pending_generation is not None):
             raise CredentialTaskError("INVALID_STATE")
         if values["dry_run"]:
             return {"dry_run": True, "action": "probe", "reference": values["ref"], "generation": ref.generation}
@@ -300,18 +421,7 @@ def _probe(values, actor):
     request_id = None
     try:
         ctx = _mint("probe", ref, correlation, actor)
-        store = secret_stores.get_store(ref.store_kind, governed=True)
-        sref = _store_ref(ref)
-        meta = store.metadata(sref, ctx)
-        request_id = getattr(meta, "request_id", None)
-        if ref.generation not in meta.versions:
-            raise secret_stores.StoreError("NOT_FOUND")
-        stored = store.read(sref, ref.generation, ctx)
-        current = _read_bundle(project_id, ref.configuration_id, ctx)
-        if not hmac.compare_digest(_digest(stored.fields), _digest(current["fields"])):
-            raise CredentialTaskError("MATERIAL_MISMATCH")
-        if current["configuration_generation"] != ref.configuration_generation:
-            raise CredentialTaskError("CONFIGURATION_CHANGED")
+        request_id = _probe_store(project_id, ref, ctx)
     except (CredentialTaskError, secret_stores.StoreError) as exc:
         is_store = isinstance(exc, secret_stores.StoreError)
         with project_tx(project_id) as session:
@@ -321,17 +431,43 @@ def _probe(values, actor):
             session.commit()
         return store_error_result(exc) if is_store else exc.result()
     #
+    if check:   # before the reference is validated: a provider that refuses the value leaves it pending
+        failure = _connection_outcome(project_id, ref, actor)
+        if failure is not None:
+            return failure
+    state = ref.state
+    if state == "pending":
+        with project_tx(project_id) as session:
+            if not transition_reference(session, ref.id, "pending", "validated", actor=actor,
+                                        validated_generation=ref.generation):
+                session.rollback()
+                raise CredentialTaskError("CONCURRENT_CHANGE")
+            audit.record(session, _event(
+                "CREDENTIAL_REF_VALIDATED", ref, actor, event_type="probe", credential_generation=ref.generation,
+                outcome="success", vault_request_id=request_id))
+            session.commit()
+        state = "validated"
+    result = {"action": "probe", "reference": values["ref"], "generation": ref.generation, "state": state,
+              "dry_run": False}
+    if check:
+        result["connection_checked"] = True
+    return result
+
+
+def _connection_outcome(project_id, ref, actor):
+    """Run the connection check and record how it went (it changes no state). Returns the refusal result, or ``None``
+    when the check passed."""
+    try:
+        _check_connection(project_id, ref, actor)
+        failure, code = None, "CREDENTIAL_CONNECTION_CHECKED"
+    except CredentialTaskError as exc:
+        failure, code = exc, "CREDENTIAL_CONNECTION_CHECK_FAILED"
     with project_tx(project_id) as session:
-        if not transition_reference(session, ref.id, "pending", "validated", actor=actor,
-                                    validated_generation=ref.generation):
-            session.rollback()
-            raise CredentialTaskError("CONCURRENT_CHANGE")
         audit.record(session, _event(
-            "CREDENTIAL_REF_VALIDATED", ref, actor, event_type="probe", credential_generation=ref.generation,
-            outcome="success", vault_request_id=request_id))
+            code, ref, actor, event_type="probe", credential_generation=ref.generation,
+            outcome="failed" if failure else "success"))
         session.commit()
-    return {"action": "probe", "reference": values["ref"], "generation": ref.generation, "state": "validated",
-            "dry_run": False}
+    return None if failure is None else failure.result()
 
 
 def _approve(values, actor):
@@ -340,7 +476,7 @@ def _approve(values, actor):
         ref = _load(session, project_id, values["ref"])
         if ref.state != "validated" or ref.approved_by is not None:
             raise CredentialTaskError("INVALID_STATE")
-        if ref.created_by == actor:
+        if actor in (ref.created_by, ref.written_by):   # not the creator, and not whoever wrote this generation
             raise CredentialTaskError("SELF_APPROVAL")
         if values["dry_run"]:
             return {"dry_run": True, "action": "approve", "reference": values["ref"], "state": "validated"}
