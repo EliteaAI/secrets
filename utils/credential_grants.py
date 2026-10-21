@@ -202,7 +202,8 @@ def _create(values, actor):
             return {"dry_run": True, "action": "create", "state": "pending_approval"}
         grant = CredentialUseGrant(
             project_id=project_id, application_id=binding.application_id, subject_kind=subject_kind(values["subject_ref"]),
-            subject_ref=values["subject_ref"], agent_binding_ref=uuid.UUID(values["binding_ref"]),
+            subject_ref=values["subject_ref"], subject_user_id=values.get("subject_user_id"),
+            agent_binding_ref=uuid.UUID(values["binding_ref"]),
             toolkit_instance_id=str(values["toolkit_id"]), credential_ref=uuid.UUID(values["ref"]),
             target_ref=ANY_TARGET, valid_until=values.get("valid_until"), state="pending_approval",
             created_by=actor, state_changed_by=actor,

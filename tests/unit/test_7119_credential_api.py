@@ -390,13 +390,21 @@ def test_a_reference_row_names_its_people_and_flags_a_changed_configuration(rest
 
 
 def test_the_list_survives_services_that_do_not_answer(rest):
-    rest.new_ref(P1)
+    rest.new_ref(P1, configuration=rest.gov.configurations.add(P1, title="GitHub prod"))
     rest.identity_down = True
-    del rest.gov.this.modules["configurations"]
+    del rest.gov.this.modules["configurations"]  # the titles come from the project's own table, not from the service
     body, status = rest.list_refs(P1)
     row = body["rows"][0]
     assert status == 200 and row["created_by"] == {"id": CREATOR, "email": None}
-    assert row["configuration"]["title"] is None and row["configuration_changed"] is None
+    assert row["configuration"]["title"] == "GitHub prod" and row["configuration_changed"] is False
+
+
+def test_a_deleted_configuration_has_no_title_and_no_change_flag(rest):
+    config = rest.gov.configurations.add(P1, title="GitHub prod")
+    rest.new_ref(P1, configuration=config)
+    rest.gov.db.execute(P1, "DELETE FROM tenant.configuration")
+    row = rest.list_refs(P1)[0]["rows"][0]
+    assert row["configuration"] == {"uuid": config.uuid, "title": None} and row["configuration_changed"] is None
 
 
 def test_the_reference_detail_counts_live_grants_and_shows_a_write_in_flight(rest):
@@ -863,13 +871,9 @@ def test_the_fake_configuration_facts_have_the_documented_shape(rest):
         assert set(fact) == DOCUMENTED_FACT_KEYS and fact["title"] == title
 
 
-def test_a_fact_without_a_title_gives_a_null_title_and_the_search_still_works(rest):
+def test_a_configuration_without_a_title_gives_a_null_title_and_the_search_still_works(rest):
     config = rest.gov.configurations.add(P1)
     rest.new_ref(P1, configuration=config)
-    service = rest.gov.this.modules["configurations"].module
-    real = service.configuration_credential_facts
-    service.configuration_credential_facts = lambda project_id, uuids: {
-        key: {k: v for k, v in fact.items() if k != "title"} for key, fact in real(project_id, uuids).items()}
     row = rest.list_refs(P1)[0]["rows"][0]
     assert row["configuration"]["title"] is None and rest.list_refs(P1, search="x")[0]["rows"] == []
 
@@ -1070,11 +1074,123 @@ def test_users_are_asked_for_in_chunks_of_at_most_a_hundred(rest):
     for extra in range(1000, 1230):
         rest.users[extra] = user(extra, f"u{extra}@x.test", oid=f"o{extra}")
     rest.members = list(rest.users)
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")   # made before the column
     rest.user_calls.clear()
     row = rest.list_grants()[0]["rows"][0]
     assert row["subject"]["user"]["id"] == MEMBER
     assert len(rest.user_calls) >= 3 and max(len(call) for call in rest.user_calls) <= 100
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")
     rest.members = list(range(5000, 7000))  # a project beyond the lookup bound: subjects stay unnamed, nobody is fetched
     rest.user_calls.clear()
     assert rest.list_grants()[0]["rows"][0]["subject"]["user"] is None
     assert {i for call in rest.user_calls for i in call} <= {CREATOR}
+
+
+# --- perf review 2026-10-21: S5 (grant subjects) and S6 (reference titles) --------------------------------------------
+
+def _statements(rest, project=P1):
+    import sqlalchemy as sa  # pylint: disable=C0415
+    seen = []
+    sa.event.listen(rest.gov.db.engine(project), "before_cursor_execute", lambda *a: seen.append(a[2]))
+    return seen
+
+
+def _selects(statements):
+    return [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+
+
+def _count_configuration_calls(rest, monkeypatch):
+    calls = []
+    service = rest.gov.configurations
+    real = service.configuration_credential_facts
+    monkeypatch.setattr(service, "configuration_credential_facts", lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
+
+def test_a_grant_stores_the_user_its_subject_was_resolved_from(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    body, _ = rest.create_grant(binding, ref, subject_user_id=MEMBER)
+    assert rest.gov.grant(P1, uuid.UUID(body["id"])).subject_user_id == MEMBER
+    task = rest.grants.manage_grant(
+        f"project_id={P1};action=create;binding_ref={binding};toolkit_id={TOOLKIT};ref={ref};subject_ref=idp:t1:o20", CREATOR)
+    assert rest.gov.grant(P1, uuid.UUID(task["grant"])).subject_user_id is None   # the task knows a subject, not a user
+
+
+def test_the_grants_page_names_users_in_one_call_and_never_lists_the_members(rest):
+    ref = rest.new_ref(P1, until="active")
+    for n in range(7):
+        toolkit = 100 + n
+        binding = rest.seed_binding(application_id=100 + n, version_id=200 + n, tools=(toolkit,))
+        for user_id in (MEMBER, APPROVER, CREATOR):
+            assert rest.create_grant(binding, ref, subject_user_id=user_id, toolkit_id=toolkit)[1] == 201
+    rest.user_calls.clear()
+    rest.member_calls = 0
+    body, status = rest.list_grants(limit=20)
+    assert status == 200 and len(body["rows"]) == 20 and body["total"] == 21
+    assert rest.member_calls == 0
+    assert len(rest.user_calls) == 1 and set(rest.user_calls[0]) == {MEMBER, APPROVER, CREATOR}
+    assert {row["subject"]["user"]["id"] for row in body["rows"]} == {MEMBER, APPROVER, CREATOR}
+
+
+def test_a_grant_without_a_stored_user_is_named_from_the_members_once_and_remembered(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    grant = rest.create_grant(binding, ref, subject_user_id=MEMBER)[0]["id"]
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")
+    rest.member_calls = 0
+    row = rest.list_grants()[0]["rows"][0]
+    assert row["subject"]["user"] == {"id": MEMBER, "email": "member@x.test"} and rest.member_calls == 1
+    assert rest.gov.grant(P1, uuid.UUID(grant)).subject_user_id == MEMBER
+    rest.member_calls = 0
+    again = rest.list_grants()[0]["rows"][0]
+    assert again["subject"]["user"]["id"] == MEMBER and rest.member_calls == 0
+
+
+def test_a_subject_nobody_resolves_stays_unnamed_and_nothing_is_stored(rest):
+    ref, binding = rest.new_ref(P1, until="active"), rest.seed_binding()
+    grant = rest.create_grant(binding, ref, subject_user_id=MEMBER)[0]["id"]
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")
+    rest.members = [CREATOR]
+    assert rest.list_grants()[0]["rows"][0]["subject"]["user"] is None
+    assert rest.gov.grant(P1, uuid.UUID(grant)).subject_user_id is None
+
+
+def test_a_mandate_grant_needs_no_user(rest):
+    ref, binding = str(rest.gov.add_reference(P1, state="active")), rest.seed_binding()
+    rest.gov.add_grant(P1, credential_ref=uuid.UUID(ref), agent_binding_ref=uuid.UUID(binding), state="active",
+                       subject_kind="mandate", subject_ref=f"mandate:{uuid.uuid4()}")
+    rest.member_calls = 0
+    row = rest.list_grants()[0]["rows"][0]
+    assert row["subject"]["user"] is None and rest.member_calls == 0
+
+
+def test_the_reference_search_is_one_statement_pair_and_asks_the_configurations_service_for_nothing(rest, monkeypatch):
+    for n in range(25):
+        rest.new_ref(P1, configuration=rest.gov.configurations.add(P1, type_="jira", title=f"Config {n}"))
+    wanted = rest.gov.configurations.add(P1, type_="github", title="Payments gateway")
+    wanted_ref = rest.new_ref(P1, configuration=wanted)
+    calls = _count_configuration_calls(rest, monkeypatch)
+    statements = _statements(rest)
+    body, status = rest.list_refs(P1, search="gateway", limit=5)
+    assert status == 200 and [row["id"] for row in body["rows"]] == [wanted_ref] and body["total"] == 1
+    assert calls == []
+    selects = [s for s in _selects(statements) if "credential_reference" in s]
+    assert len(selects) == 2   # the count and the page; the users of the page come from the identity service
+    assert not [s for s in statements if "credential_reference" in s and "LIMIT 1000" in s]   # no title scan
+
+
+def test_a_reference_page_and_a_grants_page_need_no_configuration_call(rest, monkeypatch):
+    ref = rest.new_ref(P1, until="active", configuration=rest.gov.configurations.add(P1, title="Jira prod"))
+    rest.create_grant(rest.seed_binding(), ref)
+    calls = _count_configuration_calls(rest, monkeypatch)
+    assert rest.list_refs(P1)[0]["rows"][0]["configuration"]["title"] == "Jira prod"
+    assert rest.get_ref(ref)[0]["configuration"]["title"] == "Jira prod"
+    assert rest.list_grants()[0]["rows"][0]["credential"]["configuration_title"] == "Jira prod"
+    assert calls == []
+
+
+def test_a_reference_page_is_one_count_and_one_page_statement(rest):
+    for n in range(3):
+        rest.new_ref(P1, configuration=rest.gov.configurations.add(P1, title=f"T{n}"))
+    statements = _statements(rest)
+    assert rest.list_refs(P1)[1] == 200
+    assert len([s for s in _selects(statements) if "credential_reference" in s]) == 2

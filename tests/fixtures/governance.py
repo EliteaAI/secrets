@@ -55,6 +55,9 @@ VERSION = sa.Table("application_versions", TEST_TABLES, sa.Column("id", sa.Integ
                    sa.Column("name", sa.String), schema=SCHEMA)
 TOOL = sa.Table("elitea_tools", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
                 sa.Column("type", sa.String), sa.Column("name", sa.String), schema=SCHEMA)
+CONFIGURATION = sa.Table("configuration", TEST_TABLES, sa.Column("id", sa.Integer, primary_key=True),
+                         sa.Column("uuid", sa.Uuid, unique=True), sa.Column("elitea_title", sa.String),
+                         sa.Column("generation", sa.Integer), schema=SCHEMA)
 AUDIT_OUTBOX = sa.Table("audit_outbox", TEST_TABLES, sa.Column("event_id", sa.String, primary_key=True),
                         sa.Column("body", sa.Text), schema=SCHEMA)
 
@@ -333,8 +336,9 @@ class FakeTracing:
 class FakeConfigurations:
     """The two in-process methods, over an in-memory table. ``bundle`` is as strict about the context as the real one."""
 
-    def __init__(self, stores):
+    def __init__(self, stores, databases=None):
         self.stores = stores
+        self.databases = databases  # the table the credential lists join with is kept in step with ``rows``
         self.rows = {}  # project_id -> {id: row}
         self.bundle_calls = []
         self.bundle_error = None
@@ -348,11 +352,25 @@ class FakeConfigurations:
             generation=generation, title=title,
             secrets=dict(secrets if secrets is not None else {"api_key": FIXTURE_VALUE}))
         rows[row.id] = row
+        self._mirror(row, insert=True)
         return row
+
+    def _mirror(self, row, insert=False):
+        if self.databases is None:
+            return
+        with self.databases.get_session(row.project_id) as session:
+            if insert:
+                session.execute(CONFIGURATION.insert().values(
+                    id=row.id, uuid=uuid.UUID(row.uuid), elitea_title=row.title, generation=row.generation))
+            else:
+                session.execute(CONFIGURATION.update().where(CONFIGURATION.c.id == row.id).values(
+                    generation=row.generation))
+            session.commit()
 
     def edit_secret(self, row, **secrets):
         row.secrets.update(secrets)
         row.generation += 1
+        self._mirror(row)
 
     def configuration_credential_facts(self, project_id, uuids):
         """The shape of the real method: ``{uuid: {id, project_id, type, section, generation, title}}`` (``title`` is the
@@ -528,7 +546,7 @@ class Governance:
         self.db.dispose()
         self.db.start(directory)
         self.tracing = FakeTracing()
-        self.configurations = FakeConfigurations(self.stores)
+        self.configurations = FakeConfigurations(self.stores, self.db)
         self.admin = FakeAdmin()
         self.core = FakeCore()
         self._saved_modules = dict(self.this.modules)  # other suites keep their own entries (elitea_core config)

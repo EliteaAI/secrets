@@ -536,7 +536,8 @@ def create_grant(project_id):
     body = parse_body(GrantCreate, read_json_object())
     values = {"project_id": project_id, "action": "create", "binding_ref": body.agent_binding_ref,
               "toolkit_id": body.toolkit_id, "ref": body.credential_ref,
-              "subject_ref": queries.subject_ref_of_user(body.subject_user_id), "dry_run": False}
+              "subject_ref": queries.subject_ref_of_user(body.subject_user_id), "subject_user_id": body.subject_user_id,
+              "dry_run": False}
     if body.valid_until is not None:
         values["valid_until"] = body.valid_until
     return result_reply(run_grant_action(values, actor_id(), audit_code=True), created=True)

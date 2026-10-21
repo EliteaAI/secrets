@@ -360,3 +360,19 @@ def test_the_startup_guard_adds_the_grant_subject_column_where_it_is_missing(gov
     assert run_guard(plugin, monkeypatch, gov, [], ungranted=[3, 9]) == [] and plugin.granted == [[3, 9]]
     assert run_guard(plugin, monkeypatch, gov, [4], ungranted=[]) == [[4]] and plugin.granted == []   # tables first
     assert run_guard(plugin, monkeypatch, gov, [], ungranted=[]) == [] and plugin.granted == []        # steady state
+
+
+def _grant_columns(gov, project_id):
+    return {row["name"] for row in gov.db.execute(project_id, 'PRAGMA table_info("credential_use_grant")')}
+
+
+def test_the_grant_subject_column_is_added_once_and_a_dry_run_changes_nothing(gov, schema):
+    gov.db.execute(3, "ALTER TABLE tenant.credential_use_grant DROP COLUMN subject_user_id")
+    assert "subject_user_id" not in _grant_columns(gov, 3)
+    assert schema.apply_grant_subject_user_id([3], dry_run=True) == ([3], [])
+    assert "subject_user_id" not in _grant_columns(gov, 3)
+    assert schema.apply_grant_subject_user_id([3]) == ([3], [])
+    assert "subject_user_id" in _grant_columns(gov, 3)
+    assert schema.apply_grant_subject_user_id([3]) == ([3], [])   # idempotent
+    row = gov.grant(3, gov.add_grant(3))
+    assert row.subject_user_id is None   # additive and nullable: a grant made before it needs nothing
