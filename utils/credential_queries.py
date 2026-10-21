@@ -12,10 +12,13 @@ schema), so a page needs no call to the configurations plugin and a title search
 for the page (S5); only a grant that has none yet (made before the column) is looked up by its subject (the issuer of
 its tenant is taken from the users of the page; with none known, the project's members are looked at), and the user it
 resolves is stored on the grant, so this happens once per grant. A subject nobody could name is not looked for again
-for ``UNRESOLVABLE_TTL_S`` (per process). So the view-only GET of a grants
+for ``UNRESOLVABLE_TTL_S`` (per process). The subjects of a page are looked up with one ``auth_get_users_by_idp_subjects``
+call per issuer (#7122; one round trip, not one per subject); an identity service that does not have it yet is asked
+one subject at a time as before, and not asked for the bulk call again for ``BULK_UNAVAILABLE_TTL_S``. So the view-only GET of a grants
 list can write: the idempotent backfill of ``subject_user_id`` (a conditional UPDATE of NULL columns, best effort).
 A configuration table that cannot be read leaves titles empty instead of failing a list.
 """
+import queue
 import time
 import uuid
 from typing import NamedTuple, Optional
@@ -23,7 +26,7 @@ from typing import NamedTuple, Optional
 from pylon.core.tools import log
 from sqlalchemy import Column, Integer, MetaData, String, Table, Uuid, bindparam, func, null, or_, select, update
 from sqlalchemy.exc import OperationalError, ProgrammingError
-from tools import auth, config as c
+from tools import auth, config as c, this
 
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger, CredentialUseGrant
 from .credential_errors import CredentialTaskError
@@ -33,6 +36,9 @@ from .credential_schema import project_tx
 MAX_USER_IDS = 100  # users asked of the identity service in one call
 UNRESOLVABLE_TTL_S = 600  # how long a subject nobody could name is not looked for again (per process)
 MAX_UNRESOLVABLE = 10_000
+BULK_SUBJECTS_PER_CALL = 200  # auth_core refuses more subjects than this in one auth_get_users_by_idp_subjects call
+BULK_RPC_TIMEOUT_S = 15  # as the proxies of tools.auth
+BULK_UNAVAILABLE_TTL_S = 600  # how long an identity service without the bulk call is not asked for it again (per process)
 MAX_MEMBER_LOOKUP = 1000  # a project with more members does not get its subjects named
 IN_FLIGHT = ("intent", "written")
 LIVE_GRANT_STATES = ("pending_approval", "active", "suspended")
@@ -202,22 +208,77 @@ def _mark_unresolved(project_id, subjects):
         _UNRESOLVABLE[(project_id, subject)] = expires
 
 
-def _users_of_subjects(subjects, issuers) -> dict:
-    """``{subject_ref: {id, email}}`` for subjects whose tenant has a known issuer, one ``get_user_by_idp_subject`` for
-    each (the caller bounds them by the page). A lookup that fails is logged and leaves the subject unnamed."""
-    named = {}
-    for subject in sorted(subjects):
-        _, tid, oid = subject.split(":", 2)
-        issuer = issuers.get(tid)
-        if issuer is None:
-            continue
+_BULK = {"unavailable_until": 0.0}   # monotonic time until which the bulk subject lookup is not tried
+
+
+def _is_user(user) -> bool:
+    return isinstance(user, dict) and isinstance(user.get("id"), int)
+
+
+def _bulk_users(issuer, pairs):
+    """``{"tid:oid": user}`` from ``auth_get_users_by_idp_subjects`` (one call per ``BULK_SUBJECTS_PER_CALL`` subjects,
+    so one for a page), or None when it cannot be used: a pylon_auth without the handler never answers (``queue.Empty``
+    or a timeout), which is remembered for ``BULK_UNAVAILABLE_TTL_S`` so a page does not wait for it again. Any other
+    failure is logged and also leaves the subjects to the single lookup of the caller."""
+    if _clock() < _BULK["unavailable_until"]:
+        return None
+    found = {}
+    try:
+        rpc = this.for_module("secrets").module.context.rpc_manager.timeout(BULK_RPC_TIMEOUT_S)
+        for start in range(0, len(pairs), BULK_SUBJECTS_PER_CALL):
+            answer = rpc.auth_get_users_by_idp_subjects(
+                issuer=issuer, subjects=[{"tid": tid, "oid": oid} for tid, oid in pairs[start:start + BULK_SUBJECTS_PER_CALL]])
+            if isinstance(answer, dict):
+                found.update(answer)
+    except (queue.Empty, TimeoutError):
+        _BULK["unavailable_until"] = _clock() + BULK_UNAVAILABLE_TTL_S
+        log.warning("credential api: bulk subject lookup not answered, using single lookups for %ss", BULK_UNAVAILABLE_TTL_S)
+        return None
+    except Exception as exc:  # pylint: disable=W0703
+        log.error("credential api: bulk subject lookup failed (%s)", type(exc).__name__)
+        return None
+    return found
+
+
+def _single_users(issuer, pairs):
+    """The same answer as ``_bulk_users``, one ``get_user_by_idp_subject`` for each subject. A lookup that fails is
+    logged and leaves the subject unnamed; an identity service that does not answer at all ends the loop (each further
+    subject would wait for the same timeout)."""
+    found = {}
+    for tid, oid in pairs:
         try:
             user = auth.get_user_by_idp_subject(issuer, tid, oid)
+        except (queue.Empty, TimeoutError):
+            log.error("credential api: subject lookup not answered, the remaining subjects are not looked up")
+            break
         except Exception as exc:  # pylint: disable=W0703
             log.error("credential api: subject lookup failed (%s)", type(exc).__name__)
             continue
-        if isinstance(user, dict) and isinstance(user.get("id"), int):
-            named[subject] = {"id": user["id"], "email": user.get("email")}
+        if user is not None:
+            found[f"{tid}:{oid}"] = user
+    return found
+
+
+def _users_of_subjects(subjects, issuers) -> dict:
+    """``{subject_ref: {id, email}}`` for subjects whose tenant has a known issuer: one bulk lookup per issuer (normally
+    one for the page; the caller bounds the subjects by the page), the single lookup for each subject when the identity
+    service has no bulk one. A lookup that fails is logged and leaves the subject unnamed."""
+    by_issuer = {}
+    for subject in sorted(subjects):
+        _, tid, oid = subject.split(":", 2)
+        issuer = issuers.get(tid)
+        if issuer is not None:
+            by_issuer.setdefault(issuer, []).append((subject, tid, oid))
+    named = {}
+    for issuer, items in by_issuer.items():
+        pairs = [(tid, oid) for _, tid, oid in items]
+        users = _bulk_users(issuer, pairs)
+        if users is None:
+            users = _single_users(issuer, pairs)
+        for subject, tid, oid in items:
+            user = users.get(f"{tid}:{oid}")
+            if _is_user(user):
+                named[subject] = {"id": user["id"], "email": user.get("email")}
     return named
 
 

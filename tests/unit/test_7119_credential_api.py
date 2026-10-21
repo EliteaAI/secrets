@@ -7,6 +7,7 @@ the handlers check themselves is exercised with the permission set the fake hand
 """
 import io
 import json
+import queue
 import types
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,7 @@ class Rest:
         self.projects = {P1, P2}
         self.project_rpc_down = False
         self.user_calls, self.member_calls, self.subject_calls = [], 0, []
+        self.bulk_calls, self.bulk_mode = [], "ok"   # bulk mode: ok | missing (pylon_auth without the handler)
         self.onboarding = gov.module("utils.credential_onboarding")
         self.grants = gov.module("utils.credential_grants")
         self.set_actor(CREATOR)
@@ -87,6 +89,21 @@ class Rest:
                 raise ConnectionError("down")
             found = [u for u in self.users.values() if (u["idp_issuer"], u["idp_tid"], u["idp_oid"]) == (issuer, tid, oid)]
             return dict(found[0]) if found else None
+
+        def auth_get_users_by_idp_subjects(issuer, subjects):
+            self.bulk_calls.append((issuer, [(item["tid"], item["oid"]) for item in subjects]))
+            if self.bulk_mode == "missing":
+                raise queue.Empty()
+            if self.identity_down:
+                raise ConnectionError("down")
+            wanted = {(item["tid"], item["oid"]) for item in subjects}
+            return {f"{u['idp_tid']}:{u['idp_oid']}": dict(u) for u in self.users.values()
+                    if u["idp_issuer"] == issuer and (u["idp_tid"], u["idp_oid"]) in wanted}
+
+        rpc = types.SimpleNamespace(timeout=lambda seconds: types.SimpleNamespace(
+            auth_get_users_by_idp_subjects=auth_get_users_by_idp_subjects))
+        self.monkeypatch.setitem(self.gov.this.modules, "secrets", types.SimpleNamespace(
+            module=types.SimpleNamespace(context=types.SimpleNamespace(rpc_manager=rpc))))
 
         def list_project_user_roles(project_id):
             self.member_calls += 1
@@ -1152,11 +1169,12 @@ def test_a_grant_without_a_stored_user_is_named_by_its_subject_once_and_remember
     grant = _legacy_grant(rest)
     row = rest.list_grants()[0]["rows"][0]
     assert row["subject"]["user"] == {"id": MEMBER, "email": "member@x.test"}
-    assert rest.subject_calls == [("https://issuer.test", "t1", "o30")] and rest.member_calls == 0
+    assert rest.bulk_calls == [("https://issuer.test", [("t1", "o30")])] and rest.subject_calls == []
+    assert rest.member_calls == 0
     assert rest.gov.grant(P1, uuid.UUID(grant)).subject_user_id == MEMBER
-    rest.subject_calls.clear()
+    rest.bulk_calls.clear()
     assert rest.list_grants()[0]["rows"][0]["subject"]["user"]["id"] == MEMBER
-    assert rest.subject_calls == [] and rest.member_calls == 0
+    assert rest.bulk_calls == [] and rest.subject_calls == [] and rest.member_calls == 0
 
 
 def test_without_an_issuer_on_the_page_the_members_are_looked_at_once_and_remembered(rest):
@@ -1164,7 +1182,7 @@ def test_without_an_issuer_on_the_page_the_members_are_looked_at_once_and_rememb
     rest.users[CREATOR] = user(CREATOR, "creator@x.test", tid=None)   # the only user of the page has no issuer to offer
     row = rest.list_grants()[0]["rows"][0]
     assert row["subject"]["user"] == {"id": MEMBER, "email": "member@x.test"}
-    assert rest.subject_calls == [] and rest.member_calls == 1
+    assert rest.bulk_calls == [] and rest.subject_calls == [] and rest.member_calls == 1
     assert rest.gov.grant(P1, uuid.UUID(grant)).subject_user_id == MEMBER
     rest.list_grants()
     assert rest.member_calls == 1
@@ -1178,15 +1196,15 @@ def test_a_subject_nobody_resolves_stays_unnamed_costs_one_lookup_per_ten_minute
     monkeypatch.setattr(queries, "_clock", lambda: now[0])
     for _ in range(3):   # a page shown again and again
         assert rest.list_grants()[0]["rows"][0]["subject"]["user"] is None
-    assert len(rest.subject_calls) == 1 and rest.member_calls == 1   # one lookup and one look at the members, once
+    assert len(rest.bulk_calls) == 1 and rest.member_calls == 1   # one lookup and one look at the members, once
     assert rest.gov.grant(P1, uuid.UUID(grant)).subject_user_id is None
     now[0] += queries.UNRESOLVABLE_TTL_S - 1
     rest.list_grants()
-    assert len(rest.subject_calls) == 1 and rest.member_calls == 1
+    assert len(rest.bulk_calls) == 1 and rest.member_calls == 1
     now[0] += 2   # ten minutes have passed
     rest.list_grants()
     rest.list_grants()
-    assert len(rest.subject_calls) == 2 and rest.member_calls == 2
+    assert len(rest.bulk_calls) == 2 and rest.member_calls == 2
 
 
 def test_a_subject_lookup_that_fails_is_retried_not_remembered(rest):
@@ -1195,6 +1213,96 @@ def test_a_subject_lookup_that_fails_is_retried_not_remembered(rest):
     assert rest.list_grants()[0]["rows"][0]["subject"]["user"] is None
     rest.identity_down = False
     assert rest.list_grants()[0]["rows"][0]["subject"]["user"]["id"] == MEMBER
+
+
+def _legacy_grants(rest, count):
+    """``count`` grants made before the column, each for another user of the identity service (all of tenant t1)."""
+    ref = rest.new_ref(P1, until="active")
+    for n in range(count):
+        user_id = 2000 + n
+        rest.users[user_id] = user(user_id, f"legacy{n}@x.test", oid=f"legacy{n}")
+        rest.members.append(user_id)
+        binding = rest.seed_binding(application_id=300 + n, version_id=400 + n, tools=(500 + n,))
+        assert rest.create_grant(binding, ref, subject_user_id=user_id, toolkit_id=500 + n)[1] == 201
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")   # made before the column
+    rest.member_calls, rest.subject_calls, rest.bulk_calls = 0, [], []
+
+
+def test_a_page_of_legacy_subjects_is_named_with_one_bulk_call(rest):
+    _legacy_grants(rest, 6)
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert {row["subject"]["user"]["email"] for row in rows} == {f"legacy{n}@x.test" for n in range(6)}
+    assert len(rest.bulk_calls) == 1 and len(rest.bulk_calls[0][1]) == 6   # one round trip for six subjects
+    assert rest.subject_calls == [] and rest.member_calls == 0
+    assert rest.bulk_calls[0][0] == "https://issuer.test"
+
+
+def test_the_subjects_of_a_page_are_stored_on_their_grants_after_the_bulk_lookup(rest):
+    _legacy_grants(rest, 4)
+    rest.list_grants(limit=20)
+    stored = rest.gov.db.execute(P1, "SELECT subject_user_id FROM tenant.credential_use_grant")
+    assert sorted(row["subject_user_id"] for row in stored) == [2000, 2001, 2002, 2003]
+    rest.bulk_calls.clear()
+    rest.list_grants(limit=20)
+    assert rest.bulk_calls == [] and rest.subject_calls == []   # named from the stored ids now
+
+
+def test_more_subjects_than_the_bulk_call_takes_are_split_into_calls_of_at_most_that_many(rest, monkeypatch):
+    queries = rest.gov.module("utils.credential_queries")
+    monkeypatch.setattr(queries, "BULK_SUBJECTS_PER_CALL", 2)
+    _legacy_grants(rest, 5)
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert all(row["subject"]["user"] for row in rows)
+    assert [len(call[1]) for call in rest.bulk_calls] == [2, 2, 1]
+
+
+def test_without_the_bulk_call_the_subjects_are_looked_up_one_by_one_and_the_gap_is_remembered(rest, monkeypatch):
+    queries = rest.gov.module("utils.credential_queries")
+    now = [1000.0]
+    monkeypatch.setattr(queries, "_clock", lambda: now[0])
+    _legacy_grants(rest, 3)
+    rest.bulk_mode = "missing"   # an older pylon_auth: the request is never answered
+    rows = rest.list_grants(limit=20)[0]["rows"]
+    assert {row["subject"]["user"]["email"] for row in rows} == {f"legacy{n}@x.test" for n in range(3)}
+    assert len(rest.bulk_calls) == 1 and len(rest.subject_calls) == 3
+    assert {sub[0] for sub in rest.subject_calls} == {"https://issuer.test"}
+    # backfilled all the same
+    assert sorted(row["subject_user_id"] for row in rest.gov.db.execute(P1, "SELECT subject_user_id FROM tenant.credential_use_grant")) == [
+        2000, 2001, 2002]
+    # a page seen again soon does not wait for the missing handler again
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")
+    rest.bulk_calls.clear()
+    rest.list_grants(limit=20)
+    assert rest.bulk_calls == [] and len(rest.subject_calls) == 6
+    # and tries again once the memory has expired (the service may have been upgraded)
+    now[0] += queries.BULK_UNAVAILABLE_TTL_S + 1
+    rest.bulk_mode = "ok"
+    rest.gov.db.execute(P1, "UPDATE tenant.credential_use_grant SET subject_user_id = NULL")
+    rest.list_grants(limit=20)
+    assert len(rest.bulk_calls) == 1 and len(rest.subject_calls) == 6
+
+
+def test_an_unanswering_identity_service_costs_one_single_lookup_not_one_per_subject(rest):
+    _legacy_grants(rest, 4)
+    rest.bulk_mode = "missing"
+    real = rest.subject_calls.append
+
+    def unanswered(call):
+        real(call)
+        raise queue.Empty()
+
+    rest.monkeypatch.setattr(StubAuth, "get_user_by_idp_subject",
+                             staticmethod(lambda issuer, tid, oid: unanswered((issuer, tid, oid))), raising=False)
+    assert rest.list_grants(limit=20)[1] == 200   # still listed (the members of the project name the subjects)
+    assert len(rest.subject_calls) == 1
+
+
+def test_a_bulk_lookup_that_fails_leaves_the_page_listed_and_is_retried(rest):
+    _legacy_grants(rest, 2)
+    rest.identity_down = True
+    assert all(row["subject"]["user"] is None for row in rest.list_grants(limit=20)[0]["rows"])
+    rest.identity_down = False
+    assert all(row["subject"]["user"] for row in rest.list_grants(limit=20)[0]["rows"])
 
 
 def test_a_mandate_grant_needs_no_user(rest):

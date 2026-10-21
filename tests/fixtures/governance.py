@@ -557,6 +557,7 @@ class Governance:
         queries = sys.modules.get(f"{ALIAS}.utils.credential_queries")
         if queries is not None:   # the per-process memory of subjects nobody could name belongs to one test
             queries._UNRESOLVABLE.clear()  # pylint: disable=W0212
+            queries._BULK["unavailable_until"] = 0.0  # pylint: disable=W0212
         self.stores.reset()
         self.db.dispose()
         self.db.start(directory)
