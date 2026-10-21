@@ -12,7 +12,9 @@ value has to be probed and approved again, by someone other than its creator and
 ``suspended`` reference takes a new value too: suspend, write, probe, approve, activate is the rotation path, and the
 grants keep the reference id.
 
-A value holds every secret field of the type (a ``<path>.*`` map or array of secrets is exempt: any keys under it).
+A value holds at least one secret field of the type and nothing else (a key under a ``<path>.*`` map or array of secrets
+counts as one). It need not hold them all: a type can offer alternative ways to authenticate (an access token, a
+password, a private key) and a credential uses one. Whether the value works is for the probe to say.
 """
 import uuid
 
@@ -74,10 +76,8 @@ def _as_secrets(fields) -> dict:
 
 
 def _check_names(fields, paths):
-    """Only the secret fields of the type, and every one of them (a wildcard path needs none)."""
-    if not all(_field_allowed(name, paths) for name in fields):
-        raise CredentialTaskError("INVALID_REQUEST")
-    if not {path for path in paths if not path.endswith(".*")} <= set(fields):
+    """At least one field, and only secret fields of the type (or keys under a wildcard path): nothing more is required."""
+    if not fields or not all(_field_allowed(name, paths) for name in fields):
         raise CredentialTaskError("INVALID_REQUEST")
 
 

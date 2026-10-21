@@ -1075,15 +1075,24 @@ def test_a_retired_reference_takes_no_value(w):
 
 # --- review fixes: the value is complete, and the flags --------------------------------------------------------------------
 
-def test_a_value_holds_every_secret_field_of_the_type_but_a_wildcard_needs_none(w):
-    w.gov.configurations.secret_paths["api_cred"] = ["api_key", "client_secret", "headers.*"]
+def test_a_value_needs_at_least_one_secret_field_of_the_type_and_no_others(w):
+    """A type can offer alternative ways to authenticate (access token, password, private key): a credential uses one."""
+    w.gov.configurations.secret_paths["api_cred"] = ["access_token", "password", "app_private_key", "headers.*"]
     ref = w.personal()
-    for partial in ({"api_key": SECRET}, {"client_secret": SECRET}, {"headers.X": SECRET}, {"api_key": SECRET, "headers.X": SECRET}):
-        body, status = w.put(ref, partial)
-        assert (status, body) == (400, {"error": "The request is not valid.", "code": "INVALID_REQUEST"}), partial
+    for refused in ({}, {"token": SECRET}, {"access_token": SECRET, "token": SECRET_2}, {"headers": SECRET}, {"headers.": SECRET}):
+        body, status = w.put(ref, refused)
+        assert (status, body) == (400, {"error": "The request is not valid.", "code": "INVALID_REQUEST"}), refused
     assert w.store().calls == [] and w.gov.ledger(PROJECT) == []
-    assert w.put(ref, {"api_key": SECRET, "client_secret": SECRET_2})[1] == 200                  # no map entries needed
-    assert w.put(ref, {"api_key": SECRET, "client_secret": SECRET_2, "headers.X": "h"}, expected_generation=1)[1] == 200
+    assert w.put(ref, {"password": SECRET})[1] == 200                                    # one alternative is enough
+    assert w.put(ref, {"app_private_key": SECRET_2}, expected_generation=1)[1] == 200    # another one, later
+    assert w.put(ref, {"headers.X": "h"}, expected_generation=2)[1] == 200               # a key under a wildcard counts
+    assert w.put(ref, {"access_token": SECRET, "password": SECRET_2}, expected_generation=3)[1] == 200   # and so do several
+    assert w.store().versions[uuid.UUID(ref)][1] == {"password": SECRET}
+
+
+def test_a_type_with_no_secret_fields_takes_no_value(w):
+    w.gov.configurations.secret_paths["api_cred"] = []
+    assert w.put(w.personal())[0]["code"] == "INVALID_REQUEST"
 
 
 def test_a_false_check_connection_is_accepted_and_ignored_on_any_action(w):

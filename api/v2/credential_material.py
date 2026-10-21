@@ -15,7 +15,8 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         description="Write the value of a personal credential reference, replacing any earlier value as a new "
                     "generation (a pending, validated or suspended reference takes one). Write-only: the value is "
                     "never returned, logged or audited. The names must be the secret fields of the configuration's "
-                    "type, all of them: at most 32 fields of at most 8 KiB each, and a body of at most 32 KiB. The "
+                    "type: at least one, and no other (a type with alternative ways to authenticate takes the ones "
+                    "the credential uses); at most 32 fields of at most 8 KiB each, and a body of at most 32 KiB. The "
                     "reference goes back to pending: the new value has to be probed and approved again, by someone "
                     "other than its creator and the one who wrote it.",
         parameters=[
