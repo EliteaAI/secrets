@@ -100,7 +100,7 @@ def _minimal_port_types():  # the shapes of shared/tools/secret_stores, enough f
     purposes = frozenset({"onboard", "probe", "retire", "reconcile", "smoke", "release"})
     operation_purposes = {
         "read": {"probe", "reconcile", "smoke", "release"}, "write": {"onboard"}, "metadata": {"probe", "reconcile", "smoke"},
-        "delete_all": {"retire", "reconcile"},
+        "prune": {"retire", "reconcile"}, "delete_all": {"retire", "reconcile"},
     }
 
     class AuthorizedStoreContext:
@@ -168,6 +168,7 @@ class MemoryStore:
         self.port, self.kind = port, kind
         self.versions = {}  # ref_id -> {generation: {field: value}}
         self.calls = []  # (operation, purpose, decision_id)
+        self.read_many_calls = []  # one list of (ref_id, generation) per read_many call
         self.fail = {}  # operation -> store code, raised before any effect
         self.fail_after_effect = {}  # operation -> store code, raised after the effect (a timeout that did happen)
         self.crash_before_write = False
@@ -192,6 +193,25 @@ class MemoryStore:
             raise self.port.StoreError("NOT_FOUND")
         return self.port.SecretValue(bundle, generation)
 
+    def read_many(self, refs, generations, ctx):
+        """The port's ``read_many``: every context checked before any read, all or nothing, keyed
+        ``(ref_id, generation)``; a failing ref is named in ``details``. ``read_many_calls`` counts the calls."""
+        refs, generations = list(refs), [int(item) for item in generations]
+        contexts = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx] * len(refs)
+        if len(refs) != len(generations) or len(refs) != len(contexts) or len(refs) > 64:
+            raise ValueError("invalid read_many arguments")
+        self.read_many_calls.append([(ref.ref_id, generation) for ref, generation in zip(refs, generations)])
+        for ref, item_ctx in zip(refs, contexts):
+            self.port.check_context(item_ctx, ref, "read")
+        found = {}
+        for ref, generation, item_ctx in zip(refs, generations, contexts):
+            try:
+                found[(ref.ref_id, generation)] = self.read(ref, generation, item_ctx)
+            except self.port.StoreError as exc:
+                exc.details = {"ref_id": str(ref.ref_id)}
+                raise
+        return found
+
     def write(self, ref, value, *, expected_version, ctx):
         self._enter("write", ref, ctx)
         if self.crash_before_write:
@@ -209,6 +229,14 @@ class MemoryStore:
         self._enter("metadata", ref, ctx)
         found = set(self.versions.get(ref.ref_id, {}))
         return self.port.SecretMetadata(max(found, default=0), found, request_id="req-meta")
+
+    def prune(self, ref, keep_generations, ctx):
+        self._enter("prune", ref, ctx)
+        stored = self.versions.get(ref.ref_id, {})
+        for generation in sorted(stored)[:-keep_generations]:
+            del stored[generation]
+        found = set(stored)
+        return self.port.SecretMetadata(max(found, default=0), found)
 
     def delete_all(self, ref, ctx):
         self._enter("delete_all", ref, ctx)

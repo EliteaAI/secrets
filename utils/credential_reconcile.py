@@ -5,6 +5,11 @@ The reconciler settles ledger rows an import or a retire left behind (a crash be
 database, or a store that timed out). It looks at the store before it decides: a staged generation that
 reached the store is committed, one that did not is released, and the material of a retired or missing
 reference is deleted. It never deletes the material of a live reference. Each outcome is an audit event.
+
+When the reconciler makes a new generation current (it rolls a staged generation forward; a commit that was done and
+only the ledger behind is closed without touching the store), it prunes the store down to ``KEEP_GENERATIONS`` (the new one and the one before, which a run
+admitted just earlier may still be reading). The prune is best effort: a store that refuses or does not answer is logged
+and the settled outcome stays as it is; the next generation prunes again.
 """
 import uuid
 from collections import Counter
@@ -24,6 +29,7 @@ from .credential_schema import (
 )
 from .credential_state import commit_generation, release_generation, set_ledger_state
 
+KEEP_GENERATIONS = 2
 DEFAULT_OLDER_THAN_S = 300
 BATCH_SIZE = 200
 RECONCILE_USAGE = "project_id= is required. Format: project_id=<all|N>[;older_than_s=300][;dry_run]"
@@ -96,6 +102,16 @@ def _store_failed(project_id, view, row, actor, exc):
     return "deferred"
 
 
+def _prune_superseded(view, actor, correlation):
+    """Drop all but the newest ``KEEP_GENERATIONS`` generations of the reference from its store. Never raises and never
+    changes the settled outcome. ``correlation``: the decision id of the ``_begin`` event already committed."""
+    try:
+        secret_stores.get_store(view.store_kind, governed=True).prune(
+            _store_ref(view), KEEP_GENERATIONS, _mint("reconcile", view, correlation, actor))
+    except Exception as exc:  # pylint: disable=W0703
+        log.error("reconcile_credential_store: prune failed (%s)", type(exc).__name__)
+
+
 def _delete_material(project_id, row, view, actor, ledger_state, reason_code):
     correlation = _begin(project_id, view, row, actor)
     try:
@@ -113,7 +129,7 @@ def _settle_write(project_id, row, ref, view, actor):  # pylint: disable=R0911
         return _delete_material(project_id, row, view, actor, "abandoned", "CREDENTIAL_RECONCILED_ABANDONED")
     if ref.generation >= generation:  # the commit went through; only the ledger lagged
         _close(project_id, row, view, actor, "committed", "CREDENTIAL_RECONCILED_COMMITTED")
-        return "healed"
+        return "healed"  # the store is not touched
     if ref.pending_generation != generation:  # nothing staged: leave the store alone
         _close(project_id, row, view, actor, "abandoned", "CREDENTIAL_RECONCILED_ABANDONED")
         return "abandoned"
@@ -135,6 +151,8 @@ def _settle_write(project_id, row, ref, view, actor):  # pylint: disable=R0911
     done = _close(project_id, row, view, actor, "committed", "CREDENTIAL_RECONCILED_COMMITTED",
                   commit=True,
                   configuration_generation=(facts or {}).get("generation"))
+    if done:
+        _prune_superseded(view, actor, correlation)
     return "rolled_forward" if done else "deferred"
 
 

@@ -110,7 +110,7 @@ def test_a_staged_generation_that_reached_the_store_is_committed(gov, rec):
     reasons = [e["reason_code"] for e in gov.db.events(PROJECT)]
     assert reasons == ["CREDENTIAL_RECONCILE_STARTED", "CREDENTIAL_RECONCILED_COMMITTED"]
     started = gov.db.events(PROJECT)[0]
-    assert store(gov).calls == [("metadata", "reconcile", started["event_id"])]
+    assert store(gov).calls == [("metadata", "reconcile", started["event_id"]), ("prune", "reconcile", started["event_id"])]
 
 
 def test_a_staged_generation_the_store_never_got_is_released(gov, rec):
@@ -359,3 +359,37 @@ def test_smoke_needs_an_operator_unless_dry_run(gov, rec):
     assert rec.run_store_smoke("store_kind=corporate_vault;dry_run", 0) == {
         "dry_run": True, "action": "smoke", "store_kind": "corporate_vault"}
     assert gov.stores.get_store_calls == []
+
+
+# --- pruning old generations after a roll-forward (perf review 2026-10-21, S10) -------------------------------------
+
+def test_a_roll_forward_keeps_the_new_generation_and_the_one_before(gov, rec):
+    ref_id = stage(gov, generation=4, material_generations=(1, 2, 3, 4))
+    assert run(rec)["rolled_forward"] == 1
+    assert sorted(store(gov).versions[ref_id]) == [3, 4]
+    assert gov.reference(PROJECT, ref_id).generation == 4
+    prunes = [call for call in store(gov).calls if call[0] == "prune"]
+    assert len(prunes) == 1 and prunes[0][1] == "reconcile"   # the reconcile purpose, the committed started event as id
+    assert prunes[0][2] == gov.db.events(PROJECT)[0]["event_id"]
+
+
+def test_a_failing_prune_changes_nothing_about_the_settled_outcome(gov, rec):
+    ref_id = stage(gov, generation=4, material_generations=(1, 2, 3, 4))
+
+    def refuse(*args, **kwargs):
+        raise gov.stores.StoreError("UNAVAILABLE")
+    store(gov).prune = refuse
+    assert run(rec)["rolled_forward"] == 1
+    assert gov.reference(PROJECT, ref_id).generation == 4 and gov.ledger(PROJECT, ref_id)[0].state == "committed"
+    assert sorted(store(gov).versions[ref_id]) == [1, 2, 3, 4] and FIXTURE_VALUE not in " ".join(StubLog.records)
+
+
+def test_nothing_is_pruned_when_the_roll_forward_is_deferred_or_the_ledger_only_lagged(gov, rec, monkeypatch):
+    healed = gov.add_reference(PROJECT, generation=2)
+    gov.add_ledger(PROJECT, healed, 2, state="written")
+    store(gov).versions[healed] = {n: {"api_key": FIXTURE_VALUE} for n in (1, 2)}
+    monkeypatch.setattr(rec, "commit_generation", lambda *a, **k: False)
+    stage(gov)
+    result = run(rec)
+    assert (result["healed"], result["deferred"]) == (1, 1)
+    assert not [call for call in store(gov).calls if call[0] == "prune"]

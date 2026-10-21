@@ -42,7 +42,7 @@ GRANT_IMMUTABLE = frozenset({
     'id', 'project_id', 'application_id', 'subject_kind', 'subject_ref', 'agent_binding_ref',
     'toolkit_instance_id', 'credential_ref', 'target_ref', 'created_by',
 })
-_ONCE = frozenset({'approved_by'})
+_ONCE = frozenset({'approved_by', 'subject_user_id'})
 
 
 class ImmutableFieldChanged(ValueError):
@@ -132,6 +132,9 @@ class CredentialUseGrant(db_tools.AbstractBaseMixin, db.Base):
     application_id: Mapped[int] = mapped_column(Integer, nullable=False)
     subject_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     subject_ref: Mapped[str] = mapped_column(String(160), nullable=False)
+    # the platform user an ``idp:`` subject was resolved from when the grant was made (null for a mandate, and for a
+    # grant made before the column existed until a list resolves it); it names the subject without a member listing
+    subject_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     agent_binding_ref: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     toolkit_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
     credential_ref: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)

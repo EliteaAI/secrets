@@ -146,13 +146,19 @@ class Module:
 
 @pytest.fixture
 def patch_schema(gov, schema, monkeypatch):
-    state = types.SimpleNamespace(missing=[1, 2, 5], applied=[])
+    state = types.SimpleNamespace(missing=[1, 2, 5], applied=[], no_subject_column=[], column_applied=[])
 
     def apply(ids, dry_run=False):
         state.applied.append((list(ids), dry_run))
         return list(ids), []
+
+    def apply_column(ids, dry_run=False):
+        state.column_applied.append((list(ids), dry_run))
+        return list(ids), []
     monkeypatch.setattr(schema, "project_ids_missing_credential_tables", lambda: list(state.missing))
     monkeypatch.setattr(schema, "apply_credential_tables", apply)
+    monkeypatch.setattr(schema, "project_ids_missing_grant_subject_user_id", lambda: list(state.no_subject_column))
+    monkeypatch.setattr(schema, "apply_grant_subject_user_id", apply_column)
     return state
 
 
@@ -160,8 +166,19 @@ def test_the_task_creates_the_missing_tables_everywhere(tasks, patch_schema):
     module = Module()
     result = tasks.create_credential_governance_tables(module, param="project_id=all")
     assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False,
-                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []},
+                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []}}
     assert patch_schema.applied == [([1, 2, 5], False)] and module.listed == [{"create_success": True}]
+
+
+def test_the_task_adds_the_grant_subject_column_in_the_targeted_projects_only(tasks, patch_schema):
+    patch_schema.missing = []
+    patch_schema.no_subject_column = [1, 2, 9]
+    result = tasks.create_credential_governance_tables(Module(), param="project_id=all")
+    assert result["grant_subject_user_id"] == {"migrated": 2, "failed": 0, "failed_projects": []}
+    assert patch_schema.column_applied == [([1, 2], False)]   # project 9 is not in the project list
+    dry = tasks.create_credential_governance_tables(Module(), param="project_id=1;dry_run")
+    assert dry["grant_subject_user_id"]["migrated"] == 1 and patch_schema.column_applied[-1] == ([1], True)
 
 
 def test_the_task_dry_run_reports_what_it_would_create(tasks, patch_schema):
@@ -291,9 +308,11 @@ def test_a_registered_task_runs_the_method_on_the_module(gov, plugin, monkeypatc
     monkeypatch.setattr(plugin.module, "context", Module(), raising=False)
     plugin.module.ready()
     monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_credential_tables", lambda: [])
+    monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_grant_subject_user_id", lambda: [])
     result = gov.admin.tasks["create_credential_governance_tables"](param="project_id=7;dry_run")
     assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True,
-                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
+                      "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []},
+                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []}}
 
 
 def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
@@ -303,11 +322,14 @@ def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
     assert gov.admin.tasks == {}
 
 
-def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=()):
+def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=(), ungranted=()):
     monkeypatch.setattr(plugin.file, "Thread", lambda target, daemon: types.SimpleNamespace(start=target))
     schema = gov.module("utils.credential_schema")
     applied = []
-    plugin.written = []
+    plugin.written, plugin.granted = [], []
+    monkeypatch.setattr(schema, "project_ids_missing_grant_subject_user_id", lambda: list(ungranted))
+    monkeypatch.setattr(schema, "apply_grant_subject_user_id",
+                        lambda ids: plugin.granted.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_written_by", lambda: list(unwritten))
     monkeypatch.setattr(schema, "apply_written_by", lambda ids: plugin.written.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_credential_tables",
@@ -332,3 +354,9 @@ def test_the_startup_guard_adds_the_written_by_column_where_it_is_missing(gov, p
     assert run_guard(plugin, monkeypatch, gov, [], unwritten=[3, 9]) == [] and plugin.written == [[3, 9]]
     assert run_guard(plugin, monkeypatch, gov, [4], unwritten=[]) == [[4]] and plugin.written == []   # tables first
     assert run_guard(plugin, monkeypatch, gov, [], unwritten=[]) == [] and plugin.written == []        # steady state
+
+
+def test_the_startup_guard_adds_the_grant_subject_column_where_it_is_missing(gov, plugin, monkeypatch):
+    assert run_guard(plugin, monkeypatch, gov, [], ungranted=[3, 9]) == [] and plugin.granted == [[3, 9]]
+    assert run_guard(plugin, monkeypatch, gov, [4], ungranted=[]) == [[4]] and plugin.granted == []   # tables first
+    assert run_guard(plugin, monkeypatch, gov, [], ungranted=[]) == [] and plugin.granted == []        # steady state

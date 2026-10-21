@@ -141,7 +141,8 @@ class Module(module.ModuleModel):
         def _run():
             try:
                 from .utils.credential_schema import (  # pylint: disable=C0415
-                    apply_credential_tables, apply_written_by, project_ids_missing_credential_tables,
+                    apply_credential_tables, apply_grant_subject_user_id, apply_written_by,
+                    project_ids_missing_credential_tables, project_ids_missing_grant_subject_user_id,
                     project_ids_missing_written_by,
                 )
                 pending = project_ids_missing_credential_tables()
@@ -157,6 +158,12 @@ class Module(module.ModuleModel):
                 if unwritten:
                     migrated, failed = apply_written_by(unwritten)
                     log.info("credential governance schema: written_by added (migrated=%s failed=%s)",
+                             len(migrated), len(failed))
+                # the model reads credential_use_grant.subject_user_id too (grant_subject_user_id step)
+                ungranted = project_ids_missing_grant_subject_user_id()
+                if ungranted:
+                    migrated, failed = apply_grant_subject_user_id(ungranted)
+                    log.info("credential governance schema: subject_user_id added (migrated=%s failed=%s)",
                              len(migrated), len(failed))
             except Exception:  # pylint: disable=W0703
                 log.exception("credential governance schema: auto-migration failed")

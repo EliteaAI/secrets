@@ -8,6 +8,9 @@ Personal credential references (#7119) need two changes to a project that predat
 ``personal_index`` step of the task: the single live-reference unique index becomes a shared and a personal pair, and
 ``credential_reference.written_by`` is added (also by the startup safety net, since the model reads it). The step takes
 ``lock_timeout`` 5 s on PostgreSQL: a project whose table is busy fails alone and is reported, and the step is repeated.
+
+``credential_use_grant.subject_user_id`` (the user a grant's subject was resolved from; perf review 2026-10-21, S5) is
+the ``grant_subject_user_id`` step: additive like ``written_by``, applied by the startup safety net and by the task.
 """
 from contextlib import contextmanager
 
@@ -23,6 +26,7 @@ from ..models.credential_governance import (
 _MODELS = (CredentialReference, CredentialUseGrant, CredentialStoreLedger)
 LOCK_TIMEOUT = "5s"
 WRITTEN_BY = "written_by"
+SUBJECT_USER_ID = "subject_user_id"
 USAGE = "project_id= is required. Format: project_id=<all|N>[;dry_run]"
 
 # Only fully provisioned project schemas (they already hold the configuration table) are considered.
@@ -40,6 +44,14 @@ _MISSING_COLUMN_QUERY = text(
     "WHERE t.table_name = 'credential_reference' AND t.table_schema ~ '^p_[0-9]+$' "
     "AND NOT EXISTS (SELECT 1 FROM information_schema.columns x WHERE x.table_schema = t.table_schema "
     "AND x.table_name = 'credential_reference' AND x.column_name = 'written_by')")
+
+
+# Project schemas that have credential_use_grant but not its subject_user_id column
+_MISSING_GRANT_COLUMN_QUERY = text(
+    "SELECT t.table_schema FROM information_schema.tables t "
+    "WHERE t.table_name = 'credential_use_grant' AND t.table_schema ~ '^p_[0-9]+$' "
+    "AND NOT EXISTS (SELECT 1 FROM information_schema.columns x WHERE x.table_schema = t.table_schema "
+    "AND x.table_name = 'credential_use_grant' AND x.column_name = 'subject_user_id')")
 
 
 def _new_indexes():
@@ -75,10 +87,11 @@ def _index_names(session) -> set:
     return {row[0] for row in rows}
 
 
-def _column_names(session) -> set:
-    """The column names of the project's ``credential_reference`` (the catalog, as for the indexes)."""
+def _column_names(session, table=None) -> set:
+    """The column names of the project's ``credential_reference`` (or ``table``), read from the catalog as the indexes
+    are."""
     connection = session.connection()
-    table = CredentialReference.__table__
+    table = CredentialReference.__table__ if table is None else table
     if connection.dialect.name == "postgresql":
         rows = connection.execute(
             text("SELECT column_name FROM information_schema.columns WHERE table_schema = :schema AND table_name = :table"),
@@ -105,14 +118,17 @@ def _set_lock_timeout(connection):
         connection.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
 
 
-def _add_written_by(connection, present_columns):
-    if WRITTEN_BY in present_columns:
+def _add_integer_column(connection, table, column, present_columns):
+    if column in present_columns:
         return
-    table = CredentialReference.__table__
     preparer = connection.dialect.identifier_preparer
     schema = connection.schema_for_object(table)
     name = f"{preparer.quote_schema(schema)}.{preparer.quote(table.name)}" if schema else preparer.quote(table.name)
-    connection.execute(text(f"ALTER TABLE {name} ADD COLUMN {WRITTEN_BY} INTEGER"))
+    connection.execute(text(f"ALTER TABLE {name} ADD COLUMN {column} INTEGER"))
+
+
+def _add_written_by(connection, present_columns):
+    _add_integer_column(connection, CredentialReference.__table__, WRITTEN_BY, present_columns)
 
 
 @contextmanager
@@ -186,6 +202,36 @@ def apply_written_by(project_ids):
             migrated.append(pid)
         except Exception:  # pylint: disable=W0703
             log.exception("credential governance schema: failed to add written_by to project %s", pid)
+            failed.append({"project_id": pid})
+    return migrated, failed
+
+
+def project_ids_missing_grant_subject_user_id():
+    """One catalog query: project schemas whose ``credential_use_grant`` has no ``subject_user_id`` column yet."""
+    with db.get_session(None) as session:
+        rows = session.execute(_MISSING_GRANT_COLUMN_QUERY).fetchall()
+    return [int(row[0][2:]) for row in rows]
+
+
+def apply_grant_subject_user_id(project_ids, dry_run=False):
+    """Add ``credential_use_grant.subject_user_id`` where it is missing (``grant_subject_user_id`` step; additive and
+    idempotent; the startup safety net runs it, since the model reads the column), one transaction per project that
+    waits at most ``LOCK_TIMEOUT``. Returns ``(migrated, failed)``; on a dry run ``migrated`` is what would be added."""
+    migrated, failed = [], []
+    table = CredentialUseGrant.__table__
+    for pid in project_ids:
+        if dry_run:
+            migrated.append(pid)
+            continue
+        try:
+            with db.get_session(pid) as session:
+                connection = session.connection()
+                _set_lock_timeout(connection)
+                _add_integer_column(connection, table, SUBJECT_USER_ID, _column_names(session, table))
+                session.commit()
+            migrated.append(pid)
+        except Exception:  # pylint: disable=W0703
+            log.exception("credential governance schema: failed to add subject_user_id to project %s", pid)
             failed.append({"project_id": pid})
     return migrated, failed
 
