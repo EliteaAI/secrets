@@ -432,3 +432,25 @@ def test_with_the_real_port_each_reference_has_its_own_release_context(gov, batc
     assert batch([(ref, 2) for ref in refs])["ok"] is True
     store = gov.stores.stores["database"]
     assert [call[1] for call in store.calls] == ["release", "release"]
+
+
+def test_both_release_methods_take_their_flags_by_keyword_in_the_same_order(gov):
+    import inspect  # pylint: disable=C0415
+    method = gov.module("methods.credential_release").Method
+    flags = {}
+    for name in ("release_credential_material", "release_credential_materials"):
+        parameters = list(inspect.signature(getattr(method, name)).parameters.values())
+        flags[name] = [p.name for p in parameters if p.kind is p.KEYWORD_ONLY]
+        assert all(p.kind is p.POSITIONAL_OR_KEYWORD for p in parameters if p.name in ("project_id", "release_id", "actor_ref"))
+    assert flags["release_credential_material"] == flags["release_credential_materials"] == ["allow_validated", "allow_pending"]
+    ref = active(gov)
+    with pytest.raises(TypeError):
+        method.release_credential_materials(object(), PROJECT, [{"ref_id": str(ref), "generation": 2}], RELEASE_ID, ACTOR, True)
+
+
+def test_the_batch_answers_in_canonical_lowercase_ids(gov, batch):
+    ref = active(gov)
+    answer = batch([(str(ref).upper(), 2)])
+    assert list(answer["values"]) == [str(ref)]
+    refused = batch([(str(ref).upper(), 9)])
+    assert refused["ref_id"] == str(ref)

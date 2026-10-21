@@ -554,6 +554,9 @@ class Governance:
         self.installed = True
 
     def reset(self, directory):
+        queries = sys.modules.get(f"{ALIAS}.utils.credential_queries")
+        if queries is not None:   # the per-process memory of subjects nobody could name belongs to one test
+            queries._UNRESOLVABLE.clear()  # pylint: disable=W0212
         self.stores.reset()
         self.db.dispose()
         self.db.start(directory)
@@ -590,7 +593,7 @@ class Governance:
         models = self.module("models.credential_governance")
         values = dict(
             project_id=project_id, configuration_id=self._next(), configuration_uuid=uuid.uuid4(), provider="api_cred",
-            ownership_class="project_shared", store_kind="database", store_locator={"section": "credential_store"},
+            ownership_class="project_shared", store_kind="database", store_locator={"row": "cs"},
             created_by=10, state=state, generation=generation)
         if state in ("active", "suspended"):
             values.update(generation=max(generation, 1), approved_by=20, approval_ref="CHG-1", policy_revision="rev-1",

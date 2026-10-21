@@ -110,7 +110,7 @@ def test_a_staged_generation_that_reached_the_store_is_committed(gov, rec):
     reasons = [e["reason_code"] for e in gov.db.events(PROJECT)]
     assert reasons == ["CREDENTIAL_RECONCILE_STARTED", "CREDENTIAL_RECONCILED_COMMITTED"]
     started = gov.db.events(PROJECT)[0]
-    assert store(gov).calls == [("metadata", "reconcile", started["event_id"]), ("prune", "reconcile", started["event_id"])]
+    assert store(gov).calls == [("metadata", "reconcile", started["event_id"])]   # generation 1: nothing to prune
 
 
 def test_a_staged_generation_the_store_never_got_is_released(gov, rec):
@@ -371,6 +371,13 @@ def test_a_roll_forward_keeps_the_new_generation_and_the_one_before(gov, rec):
     prunes = [call for call in store(gov).calls if call[0] == "prune"]
     assert len(prunes) == 1 and prunes[0][1] == "reconcile"   # the reconcile purpose, the committed started event as id
     assert prunes[0][2] == gov.db.events(PROJECT)[0]["event_id"]
+
+
+def test_a_roll_forward_with_a_newer_staged_generation_prunes_nothing(gov, rec):
+    ref_id = stage(gov, generation=4, material_generations=(1, 2, 3, 4, 5))   # 5 is staged above the one rolled forward
+    assert run(rec)["rolled_forward"] == 1
+    assert sorted(store(gov).versions[ref_id]) == [1, 2, 3, 4, 5]
+    assert not [call for call in store(gov).calls if call[0] == "prune"]
 
 
 def test_a_failing_prune_changes_nothing_about_the_settled_outcome(gov, rec):

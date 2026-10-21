@@ -1336,3 +1336,47 @@ def test_without_a_registry_version_the_paths_are_asked_every_time(w, monkeypatc
     ref = w.personal()
     assert w.put(ref)[1] == 200 and w.put(ref, expected_generation=1)[1] == 200
     assert configurations.secret_fields_calls == [["api_cred"], ["api_cred"]]
+
+
+# --- old generations are pruned when a new one goes live (review of the perf PR) ----------------------------------------
+
+def _rotate(w, ref, generation, value):
+    assert w.action(ref, "suspend")[1] == 200
+    assert w.put(ref, {"api_key": value}, expected_generation=generation)[1] == 200
+    assert w.action(ref, "probe", actor=CREATOR)[1] == 200
+    assert w.action(ref, "approve", actor=APPROVER, approval_ref="CHG-2", policy_revision="rev-2")[1] == 200
+    assert w.action(ref, "activate", actor=APPROVER)[1] == 200
+
+
+def test_three_rotations_leave_the_two_newest_generations_in_the_store(w):
+    ref = w.personal()
+    w.lifecycle(ref)
+    for generation, value in ((1, "fixture-rot-2"), (2, "fixture-rot-3"), (3, "fixture-rot-4")):
+        _rotate(w, ref, generation, value)
+    assert w.row(ref).generation == 4 and w.row(ref).state == "active"
+    assert w.store().versions[uuid.UUID(ref)] == {3: {"api_key": "fixture-rot-3"}, 4: {"api_key": "fixture-rot-4"}}
+    started = [call for call in w.store().calls if call[0] == "prune"]
+    assert [call[1] for call in started] == ["reconcile", "reconcile"]   # the port allows prune to retire|reconcile only
+    activations = [e["event_id"] for e in w.events() if e["reason_code"] == "CREDENTIAL_REF_ACTIVE"]
+    assert [call[2] for call in started] == activations[2:]   # the activation event is the decision id (g3 and g4 prune)
+
+
+def test_generations_staged_above_the_live_one_stop_a_prune_and_are_never_counted(w):
+    ref_id = w.gov.add_reference(PROJECT, state="validated", generation=3, validated_generation=3, approved_by=20,
+                                 approval_ref="CHG-1", policy_revision="rev-1", ownership_class="service")
+    w.store().versions[ref_id] = {n: {"api_key": f"fixture-{n}"} for n in (1, 2, 3, 4, 5)}   # 4 and 5 are staged
+    assert w.action(ref_id, "activate", actor=APPROVER)[1] == 200
+    assert sorted(w.store().versions[ref_id]) == [1, 2, 3, 4, 5]
+    assert [call[0] for call in w.store().calls] == ["metadata"]
+    w.store().versions[ref_id] = {n: {"api_key": f"fixture-{n}"} for n in (1, 2, 3)}   # nothing above: now it prunes
+    assert w.onboarding.prune_superseded(w.row(ref_id), 3, CREATOR, str(uuid.uuid4())) is True
+    assert sorted(w.store().versions[ref_id]) == [2, 3]
+
+
+def test_a_failing_prune_leaves_the_activation_as_it_was(w):
+    ref_id = w.gov.add_reference(PROJECT, state="validated", generation=3, validated_generation=3, approved_by=20,
+                                 approval_ref="CHG-1", policy_revision="rev-1", ownership_class="service")
+    w.store().versions[ref_id] = {n: {"api_key": f"fixture-{n}"} for n in (1, 2, 3)}
+    w.store().prune = lambda *a, **k: (_ for _ in ()).throw(w.gov.stores.StoreError("UNAVAILABLE"))
+    reply = w.action(ref_id, "activate", actor=APPROVER)
+    assert reply[1] == 200 and w.row(ref_id).state == "active" and sorted(w.store().versions[ref_id]) == [1, 2, 3]

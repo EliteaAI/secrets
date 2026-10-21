@@ -12,6 +12,7 @@ Personal credential references (#7119) need two changes to a project that predat
 ``credential_use_grant.subject_user_id`` (the user a grant's subject was resolved from; perf review 2026-10-21, S5) is
 the ``grant_subject_user_id`` step: additive like ``written_by``, applied by the startup safety net and by the task.
 """
+import time
 from contextlib import contextmanager
 
 import sqlalchemy as sa
@@ -25,6 +26,8 @@ from ..models.credential_governance import (
 
 _MODELS = (CredentialReference, CredentialUseGrant, CredentialStoreLedger)
 LOCK_TIMEOUT = "5s"
+RETRY_ATTEMPTS = 3   # the startup guard tries a project that hit the lock timeout again this many times ...
+RETRY_DELAY_S = 5    # ... this long after
 WRITTEN_BY = "written_by"
 SUBJECT_USER_ID = "subject_user_id"
 USAGE = "project_id= is required. Format: project_id=<all|N>[;dry_run]"
@@ -124,7 +127,9 @@ def _add_integer_column(connection, table, column, present_columns):
     preparer = connection.dialect.identifier_preparer
     schema = connection.schema_for_object(table)
     name = f"{preparer.quote_schema(schema)}.{preparer.quote(table.name)}" if schema else preparer.quote(table.name)
-    connection.execute(text(f"ALTER TABLE {name} ADD COLUMN {column} INTEGER"))
+    # PostgreSQL: idempotent even if another replica adds the column between the catalog read and here
+    guard = "IF NOT EXISTS " if connection.dialect.name == "postgresql" else ""
+    connection.execute(text(f"ALTER TABLE {name} ADD COLUMN {guard}{column} INTEGER"))
 
 
 def _add_written_by(connection, present_columns):
@@ -203,6 +208,20 @@ def apply_written_by(project_ids):
         except Exception:  # pylint: disable=W0703
             log.exception("credential governance schema: failed to add written_by to project %s", pid)
             failed.append({"project_id": pid})
+    return migrated, failed
+
+
+def apply_with_retry(apply, project_ids, attempts=RETRY_ATTEMPTS, delay_s=RETRY_DELAY_S, sleep=time.sleep):
+    """``apply(project_ids)`` (an ``apply_*`` function returning ``(migrated, failed)``), then the projects that failed
+    (a busy table: the lock timeout) again up to ``attempts`` times, ``delay_s`` apart. Returns the totals."""
+    migrated, failed = apply(project_ids)
+    migrated = list(migrated)
+    for _ in range(attempts):
+        if not failed:
+            break
+        sleep(delay_s)
+        again, failed = apply([entry["project_id"] for entry in failed])
+        migrated.extend(again)
     return migrated, failed
 
 

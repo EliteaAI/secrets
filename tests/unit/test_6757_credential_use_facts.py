@@ -307,3 +307,22 @@ def test_grants_for_limits_and_malformed_keys(gov, facts):
                 [{"agent_binding_ref": str(uuid.uuid4())}]):
         with pytest.raises(ValueError):
             call(PROJECT, [], [], grants_for=bad)
+
+
+def test_a_pending_personal_reference_hides_the_grant_of_the_shared_one_it_shadows(gov, facts):
+    """The owner registered a value that is still pending: the shared credential is not a silent fallback, so the grant
+    on the shared reference is not offered for the owner's run (the personal reference is the chosen one)."""
+    call, _ = facts
+    owner = "idp:t1:owner"
+    shared = gov.add_reference(PROJECT, state="active", configuration_id=61)
+    personal = gov.add_reference(
+        PROJECT, state="pending", configuration_id=61, ownership_class="personal",
+        custodian_ref={"user_id": 7, "subject_ref": owner})
+    binding = uuid.uuid4()
+    gov.add_grant(PROJECT, state="active", agent_binding_ref=binding, credential_ref=shared, subject_ref=owner)
+    wanted = [(binding, "41", 61, "*", owner)]
+    mine = call(PROJECT, [61], [], personal_subject_ref=owner, grants_for=wanted)
+    assert mine["references"][61]["ref_id"] == str(personal) and mine["references"][61]["state"] == "pending"
+    assert "note" in mine["references"][61] and mine["grants"] == {}
+    others = call(PROJECT, [61], [], personal_subject_ref="idp:t1:other", grants_for=wanted)   # anyone else gets the shared one
+    assert others["references"][61]["ref_id"] == str(shared) and len(others["grants"]) == 1

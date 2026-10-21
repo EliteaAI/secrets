@@ -376,3 +376,76 @@ def test_the_grant_subject_column_is_added_once_and_a_dry_run_changes_nothing(go
     assert schema.apply_grant_subject_user_id([3]) == ([3], [])   # idempotent
     row = gov.grant(3, gov.add_grant(3))
     assert row.subject_user_id is None   # additive and nullable: a grant made before it needs nothing
+
+
+# --- the startup guard: independent steps, retried on a busy table, idempotent DDL (review of the perf PR) -----------
+
+def test_a_project_that_hit_the_lock_timeout_is_tried_again_three_times_five_seconds_apart(schema):
+    seen, slept = [], []
+
+    def apply(ids):
+        seen.append(list(ids))
+        if len(seen) < 3:   # busy twice
+            return [], [{"project_id": pid} for pid in ids]
+        return list(ids), []
+    migrated, failed = schema.apply_with_retry(apply, [3, 9], sleep=slept.append)
+    assert (migrated, failed) == ([3, 9], []) and seen == [[3, 9], [3, 9], [3, 9]] and slept == [5, 5]
+
+    def stuck(ids):
+        seen.append(list(ids))
+        return [], [{"project_id": pid} for pid in ids]
+    seen.clear(), slept.clear()
+    migrated, failed = schema.apply_with_retry(stuck, [4], sleep=slept.append)
+    assert (migrated, failed) == ([], [{"project_id": 4}]) and len(seen) == 4 and slept == [5, 5, 5]   # 1 try + 3 retries
+
+
+def test_only_the_failed_projects_are_retried(schema):
+    seen = []
+
+    def apply(ids):
+        seen.append(list(ids))
+        return ([pid for pid in ids if pid != 9], [{"project_id": 9}]) if len(seen) == 1 else (list(ids), [])
+    assert schema.apply_with_retry(apply, [3, 9], sleep=lambda _s: None) == ([3, 9], []) and seen == [[3, 9], [9]]
+
+
+def test_the_startup_guard_steps_do_not_stop_each_other(gov, plugin, monkeypatch):
+    def boom():
+        raise RuntimeError("catalog down")
+    assert run_guard(plugin, monkeypatch, gov, boom, unwritten=[3], ungranted=[5]) == []
+    assert plugin.written == [[3]] and plugin.granted == [[5]]   # the tables step failed; the two column steps ran
+
+
+def test_the_startup_guard_retries_a_busy_project(gov, plugin, monkeypatch):
+    schema = gov.module("utils.credential_schema")
+    monkeypatch.setattr(schema.time, "sleep", lambda _s: None)
+    run_guard(plugin, monkeypatch, gov, [], ungranted=[5])
+    tries = []
+
+    def busy_once(ids):
+        tries.append(list(ids))
+        return ([], [{"project_id": pid} for pid in ids]) if len(tries) == 1 else (list(ids), [])
+    monkeypatch.setattr(schema, "apply_grant_subject_user_id", busy_once)
+    plugin.module._ensure_credential_schema()   # pylint: disable=W0212
+    assert tries == [[5], [5]]
+
+
+def test_the_column_is_added_with_if_not_exists_on_postgresql(schema):
+    class Preparer:
+        @staticmethod
+        def quote_schema(name):
+            return f'"{name}"'
+
+        @staticmethod
+        def quote(name):
+            return f'"{name}"'
+
+    def run(dialect):
+        sql = []
+        connection = types.SimpleNamespace(
+            dialect=types.SimpleNamespace(name=dialect, identifier_preparer=Preparer),
+            schema_for_object=lambda _t: "p_1", execute=lambda statement: sql.append(str(statement)))
+        schema._add_integer_column(connection, types.SimpleNamespace(name="credential_use_grant"), "subject_user_id", set())  # pylint: disable=W0212
+        schema._add_integer_column(connection, types.SimpleNamespace(name="credential_use_grant"), "subject_user_id", {"subject_user_id"})  # pylint: disable=W0212
+        return sql
+    assert run("postgresql") == ['ALTER TABLE "p_1"."credential_use_grant" ADD COLUMN IF NOT EXISTS subject_user_id INTEGER']
+    assert run("sqlite") == ['ALTER TABLE "p_1"."credential_use_grant" ADD COLUMN subject_user_id INTEGER']   # present: no second
