@@ -13,9 +13,20 @@
 #   limitations under the License.
 
 """ Module """
+from threading import Thread
+
 from pylon.core.tools import log  # pylint: disable=E0611,E0401
 from pylon.core.tools import module  # pylint: disable=E0611,E0401
-from tools import auth  # pylint: disable=E0401
+from tools import auth, this  # pylint: disable=E0401
+
+# Credential governance (#6757, C-1009): admin task name -> Method attribute, all in the R-2.0.8 group
+CREDENTIAL_ADMIN_TASKS = (
+    "create_credential_governance_tables",
+    "manage_credential_reference",
+    "manage_credential_grant",
+    "reconcile_credential_store",
+    "credential_store_smoke",
+)
 
 
 class Module(module.ModuleModel):
@@ -49,6 +60,10 @@ class Module(module.ModuleModel):
     def init(self):
         """ Init module """
         log.info("Initializing module Secrets")
+        # Imported so create_all sees the credential governance tables
+        from .models import credential_governance  # pylint: disable=C0415,W0611
+        #
+        self.descriptor.init_methods()
         self.descriptor.init_api()
         self.descriptor.init_rpcs()
         self.descriptor.init_blueprint()
@@ -61,8 +76,100 @@ class Module(module.ModuleModel):
             }
         })
 
+        # Credential governance (#6757, C-1009). Registered whatever the governance flag says, so roles can
+        # be assigned before it is switched on. Only credentials.use is evaluated by the admission layer;
+        # reveal exists for a later governed reveal and is recommended to nobody, and no route reads it.
+        # view, manage, probe and approve are what the operator REST API (#7119) checks, in administration mode.
+        from .utils import credential_api  # pylint: disable=C0415
+        for permission, roles in (
+                (credential_api.VIEW, credential_api.VIEW_ROLES),
+                (credential_api.MANAGE, credential_api.OPERATE_ROLES),
+                (credential_api.PROBE, credential_api.OPERATE_ROLES),
+                (credential_api.APPROVE, credential_api.OPERATE_ROLES),
+                (credential_api.SET_OWN_VALUE, credential_api.OWN_VALUE_ROLES),
+                ("credentials.use", {
+                    "administration": {"admin": True, "viewer": False, "editor": False},
+                    "default": {"admin": True, "viewer": True, "editor": True}}),
+                ("credentials.reveal", {  # recommended to nobody (explicitly: the role model defaults system/super_admin to True)
+                    "administration": {"admin": False, "viewer": False, "editor": False, "system": False, "super_admin": False},
+                    "default": {"admin": False, "viewer": False, "editor": False, "system": False, "super_admin": False}}),
+        ):
+            auth.register_permissions({"permissions": [permission], "recommended_roles": roles})
+
         self.descriptor.init_slots()
+
+    def ready(self):
+        """ Module is ready """
+        self._register_admin_tasks()
+        self._ensure_credential_schema()
+
+    @staticmethod
+    def _wrap_admin_task(method_cls, method_name, module_instance):
+        """Plain function wrapper that keeps the docstring: the admin UI unwraps pylon's partial of a
+        @web.method() down to the module instance and would lose it."""
+        original = getattr(method_cls, method_name)
+
+        def wrapper(*args, **kwargs):
+            return original(module_instance, *args, **kwargs)
+
+        wrapper.__doc__ = original.__doc__
+        wrapper.__name__ = method_name
+        return wrapper
+
+    def _register_admin_tasks(self):
+        try:
+            from .methods.admin_tasks import Method  # pylint: disable=C0415
+            self._admin_tasks = {}
+            for name in CREDENTIAL_ADMIN_TASKS:
+                task = self._wrap_admin_task(Method, name, self)
+                this.for_module("admin").module.register_admin_task(name, task, group="R-2.0.8")
+                self._admin_tasks[name] = task
+        except Exception as e:  # pylint: disable=W0703
+            log.exception("Failed to register credential admin tasks: %s", e)
+
+    def _unregister_admin_tasks(self):
+        try:
+            for name, task in getattr(self, "_admin_tasks", {}).items():
+                this.for_module("admin").module.unregister_admin_task(name, task)
+        except Exception as e:  # pylint: disable=W0703
+            log.exception("Failed to unregister credential admin tasks: %s", e)
+
+    def _ensure_credential_schema(self):
+        """Startup safety net: create the credential governance tables in any project schema that predates
+        them (#6757). Runs off-thread; guarded by a catalog check so steady-state boots issue no DDL.
+        New projects are already covered by create_all."""
+        def _step(name, find, apply):
+            """One additive step of the safety net: it never stops the others, and a project whose table was busy
+            (the lock timeout) is tried again a few times."""
+            try:
+                pending = find()
+                if pending:
+                    migrated, failed = apply(pending)
+                    log.info("credential governance schema: %s (migrated=%s failed=%s)", name, len(migrated), len(failed))
+            except Exception:  # pylint: disable=W0703
+                log.exception("credential governance schema: %s failed", name)
+
+        def _run():
+            try:
+                from .utils.credential_schema import (  # pylint: disable=C0415
+                    apply_credential_tables, apply_grant_subject_user_id, apply_with_retry, apply_written_by,
+                    project_ids_missing_credential_tables, project_ids_missing_grant_subject_user_id,
+                    project_ids_missing_written_by,
+                )
+            except Exception:  # pylint: disable=W0703
+                log.exception("credential governance schema: auto-migration failed")
+                return
+            _step("auto-migration done", project_ids_missing_credential_tables, apply_credential_tables)
+            # the model reads written_by (#7119) and credential_use_grant.subject_user_id; adding a column is additive,
+            # the index swap is the task's
+            _step("written_by added", project_ids_missing_written_by,
+                  lambda ids: apply_with_retry(apply_written_by, ids))
+            _step("subject_user_id added", project_ids_missing_grant_subject_user_id,
+                  lambda ids: apply_with_retry(apply_grant_subject_user_id, ids))
+
+        Thread(target=_run, daemon=True).start()
 
     def deinit(self):  # pylint: disable=R0201
         """ De-init module """
         log.info("De-initializing module Secrets")
+        self._unregister_admin_tasks()

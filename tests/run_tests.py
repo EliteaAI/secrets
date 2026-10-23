@@ -96,6 +96,8 @@ class StubAuth:
 
             def decorate(func):
                 StubAuth.decorators.requirements[func.__qualname__] = descriptor
+                # handler classes share names across files; this key tells them apart
+                StubAuth.decorators.requirements[f"{func.__module__}:{func.__qualname__}"] = descriptor
                 return func
 
             return decorate
@@ -134,6 +136,8 @@ def install_stubs():
     pylon_core_tools.module = types.ModuleType('pylon.core.tools.module')
     pylon_core_tools.web = types.ModuleType('pylon.core.tools.web')
     pylon_core_tools.web.rpc = lambda *a, **kw: (lambda func: func)
+    pylon_core_tools.web.method = lambda *a, **kw: (lambda func: func)
+    pylon_core_tools.module.ModuleModel = object
 
     sys.modules.setdefault('pylon', pylon_stub)
     sys.modules.setdefault('pylon.core', pylon_core)

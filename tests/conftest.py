@@ -18,6 +18,16 @@ def plugin_root() -> pathlib.Path:
     return TESTS_DIR.parent
 
 
+@pytest.fixture
+def gov(tmp_path):
+    """Credential governance environment: real models and services over SQLite, fake collaborators."""
+    from fixtures.governance import GOV  # pylint: disable=C0415
+    GOV.install()
+    GOV.reset(tmp_path)
+    yield GOV
+    GOV.restore()
+
+
 def pytest_collection_modifyitems(items):
     for item in items:
         if '/unit/' in str(item.fspath):
