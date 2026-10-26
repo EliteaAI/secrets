@@ -30,7 +30,11 @@ MAX_SUBJECT_CHARS = 160
 #    the caller's own personal reference of a configuration (#7119).
 # 4: ``credential_use_facts`` takes ``grants_for`` (grant keys whose credential may be named by configuration id), so
 #    references and the grants on them are one session (perf review 2026-10-21, M4/M5). The result shape is v3's.
-CREDENTIAL_FACTS_VERSION = 4
+# 5: ``credential_use_facts`` takes ``subject_grants`` (``(credential, subject_ref)`` pairs) and answers the active grants
+#    a subject holds on a credential whatever the binding and toolkit, for development runs (#7213). The result shape
+#    gains ``subject_grants`` only when asked.
+CREDENTIAL_FACTS_VERSION = 5
+MAX_SUBJECT_GRANT_ROWS = 64   # active grants returned for all the subject_grants pairs of one call together
 KEY_FIELDS = ("agent_binding_ref", "toolkit_instance_id", "credential_ref", "target_ref", "subject_ref")
 
 
@@ -81,6 +85,25 @@ def _grant_for(item) -> tuple:
     else:
         wanted = _uuid(credential)
     return str(_uuid(binding)), str(toolkit), wanted, str(target), str(subject)
+
+
+def _subject_grant(item) -> tuple:
+    """A ``subject_grants`` pair: ``(credential, subject_ref)``, the credential a reference id or (as in ``grants_for``) the
+    id of a configuration among this call's ``config_ids``/``ref_ids``. Returns the pair with the credential as
+    ``uuid.UUID`` or ``int``."""
+    if not isinstance(item, (list, tuple)) or len(item) != 2:
+        raise ValueError("subject grant key needs exactly credential, subject_ref")
+    credential, subject = item
+    if isinstance(credential, bool) or not isinstance(subject, str) or not 0 < len(subject) <= MAX_SUBJECT_CHARS:
+        raise ValueError("subject grant key: a reference id or a configuration id, and a subject reference")
+    return (credential if isinstance(credential, int) else _uuid(credential)), subject
+
+
+def _grant_facts(row) -> dict:
+    return {
+        "grant_id": str(row.id), "state": row.state, "subject_kind": row.subject_kind,
+        "revocation_epoch": row.revocation_epoch, "valid_from": _iso(row.valid_from),
+        "valid_until": _iso(row.valid_until), "operations": list(row.operations or [])}
 
 
 def _custodian_user_id(custodian_ref):
@@ -158,6 +181,7 @@ class Method:
     def credential_use_facts(  # pylint: disable=R0913
         self, project_id: int, config_ids: list, grant_keys: list, ref_ids: list = None,
         personal_subject_ref: str = None, personal_user_id: int = None, grants_for: list = None,
+        subject_grants: list = None,
     ) -> dict:
         """Live credential references and grants, for admission and the re-check of a queued run.
 
@@ -187,13 +211,21 @@ class Method:
         (``personal_subject_ref`` = ``idp:<tenant>:<object>``, or ``personal_user_id``), else the non-personal one,
         else (so the class can be refused by name) another owner's personal reference. ``custodian_subject_ref`` is the
         owner's subject of a personal reference.
+
+        ``subject_grants`` (optional, at most 64, #7213): ``(credential, subject_ref)`` pairs, the credential a reference
+        id or the id of a configuration this call resolves (as in ``grants_for``). The answer gains a third key,
+        ``"subject_grants": {"<ref_id>|<subject_ref>": [grant, ...]}``: the ``active`` grants that subject holds on that
+        reference whatever their binding and toolkit (each as in ``grants`` plus ``agent_binding_ref`` and
+        ``toolkit_instance_id``), at most ``MAX_SUBJECT_GRANT_ROWS`` rows for the whole call, oldest first (ties in any order); a pair with
+        none is absent. Whether a grant is in force (its validity window) is for the caller to decide, as for ``grants``.
         """
         _caller_subject(personal_subject_ref, personal_user_id)
         configs = [int(item) for item in _bounded("config_ids", config_ids)]
         refs = [_uuid(item) for item in _bounded("ref_ids", ref_ids)]
         keys = {_key(item) for item in _bounded("grant_keys", grant_keys)}
         later = [_grant_for(item) for item in _bounded("grants_for", grants_for)]
-        references, grants = {}, {}
+        by_subject = [_subject_grant(item) for item in _bounded("subject_grants", subject_grants)]
+        references, grants, held = {}, {}, {}
         with db.get_session(project_id) as session:
             if refs:
                 for row in session.execute(select(CredentialReference).where(
@@ -222,9 +254,28 @@ class Method:
                     found = (str(row.agent_binding_ref), row.toolkit_instance_id, str(row.credential_ref),
                              row.target_ref, row.subject_ref)
                     if found in keys:  # the IN lists are a superset of the pairs asked for
-                        grants[grant_key_string(found)] = {
-                            "grant_id": str(row.id), "state": row.state, "subject_kind": row.subject_kind,
-                            "revocation_epoch": row.revocation_epoch, "valid_from": _iso(row.valid_from),
-                            "valid_until": _iso(row.valid_until),
-                            "operations": list(row.operations or [])}
-        return {"references": references, "grants": grants}
+                        grants[grant_key_string(found)] = _grant_facts(row)
+            pairs = set()
+            for credential, subject in by_subject:   # the reference is known now
+                if isinstance(credential, int):
+                    found_ref = references.get(credential)
+                    if found_ref is None:
+                        continue
+                    credential = found_ref["ref_id"]
+                pairs.add((str(credential), subject))
+            if pairs:
+                for row in session.execute(select(CredentialUseGrant).where(
+                        CredentialUseGrant.project_id == project_id, CredentialUseGrant.state == "active",
+                        CredentialUseGrant.credential_ref.in_([_uuid(pair[0]) for pair in pairs]),
+                        CredentialUseGrant.subject_ref.in_({pair[1] for pair in pairs}))
+                        .order_by(CredentialUseGrant.created_at, CredentialUseGrant.id)
+                        .limit(MAX_SUBJECT_GRANT_ROWS)).scalars():
+                    pair = (str(row.credential_ref), row.subject_ref)
+                    if pair in pairs:  # the IN lists are a superset of the pairs asked for
+                        held.setdefault("|".join(pair), []).append({
+                            **_grant_facts(row), "agent_binding_ref": str(row.agent_binding_ref),
+                            "toolkit_instance_id": row.toolkit_instance_id})
+        result = {"references": references, "grants": grants}
+        if subject_grants is not None:
+            result["subject_grants"] = held
+        return result

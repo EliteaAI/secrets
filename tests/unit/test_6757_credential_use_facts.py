@@ -160,8 +160,8 @@ def test_the_answer_has_no_locator_secret_or_store_path(gov, facts):
 
 def test_the_facts_version_is_exported_where_a_startup_check_can_read_it(gov, facts):
     _, method = facts
-    assert method.CREDENTIAL_FACTS_VERSION == 4 == method.Method.CREDENTIAL_FACTS_VERSION
-    assert method.Method.credential_facts_version(object()) == 4
+    assert method.CREDENTIAL_FACTS_VERSION == 5 == method.Method.CREDENTIAL_FACTS_VERSION
+    assert method.Method.credential_facts_version(object()) == 5
 
 
 def test_grant_facts_carry_the_subject_kind_for_both_kinds(gov, facts):
@@ -326,3 +326,60 @@ def test_a_pending_personal_reference_hides_the_grant_of_the_shared_one_it_shado
     assert "note" in mine["references"][61] and mine["grants"] == {}
     others = call(PROJECT, [61], [], personal_subject_ref="idp:t1:other", grants_for=wanted)   # anyone else gets the shared one
     assert others["references"][61]["ref_id"] == str(shared) and len(others["grants"]) == 1
+
+
+# --- subject_grants: the active grants a subject holds on a credential, whatever the binding (#7213) ----------------
+
+def test_subject_grants_answer_every_active_grant_of_the_subject_on_the_credential(gov, facts):
+    call, _ = facts
+    ref_id = gov.add_reference(PROJECT, state="active")
+    first = gov.grant(PROJECT, gov.add_grant(PROJECT, state="active", credential_ref=ref_id, toolkit_instance_id="41"))
+    second = gov.grant(PROJECT, gov.add_grant(PROJECT, state="active", credential_ref=ref_id, toolkit_instance_id="42",
+                                              revocation_epoch=2))
+    gov.add_grant(PROJECT, state="suspended", credential_ref=ref_id, toolkit_instance_id="43")   # not active
+    gov.add_grant(PROJECT, state="active", credential_ref=ref_id, subject_ref="idp:t1:u2")        # another subject
+    gov.add_grant(PROJECT, state="active", subject_ref=SUBJECT)                                   # another credential
+    result = call(PROJECT, [], [], subject_grants=[(ref_id, SUBJECT)])
+    assert set(result) == {"references", "grants", "subject_grants"} and result["grants"] == {}
+    key = f"{ref_id}|{SUBJECT}"
+    assert list(result["subject_grants"]) == [key]
+    found = result["subject_grants"][key]
+    assert sorted((g["grant_id"], g["toolkit_instance_id"], g["agent_binding_ref"], g["revocation_epoch"]) for g in found) == sorted([
+        (str(first.id), "41", str(first.agent_binding_ref), 0), (str(second.id), "42", str(second.agent_binding_ref), 2)])
+    assert all(g["state"] == "active" and g["subject_kind"] == "user_delegation" and g["valid_from"] for g in found)
+
+
+def test_subject_grants_by_configuration_id_follow_the_reference_the_call_resolved(gov, facts):
+    call, _ = facts
+    ref, grant = _active_with_grant(gov)
+    result = call(PROJECT, [ref.configuration_id], [], subject_grants=[(ref.configuration_id, SUBJECT)])
+    assert list(result["references"]) == [ref.configuration_id]
+    assert [g["grant_id"] for g in result["subject_grants"][f"{ref.id}|{SUBJECT}"]] == [str(grant.id)]
+    # a configuration with no reference, or a pair with no grant, is absent (not an empty list)
+    missing = call(PROJECT, [999], [], subject_grants=[(999, SUBJECT), (uuid.uuid4(), SUBJECT)])
+    assert missing == {"references": {}, "grants": {}, "subject_grants": {}}
+
+
+def test_subject_grants_are_absent_from_the_answer_unless_asked_and_stay_in_the_project(gov, facts):
+    call, _ = facts
+    ref_id = gov.add_reference(PROJECT, state="active")
+    gov.add_grant(PROJECT, state="active", credential_ref=ref_id)
+    assert set(call(PROJECT, [], [])) == {"references", "grants"}
+    assert call(PROJECT + 1, [], [], subject_grants=[(ref_id, SUBJECT)])["subject_grants"] == {}
+    # the IN lists are a superset of the pairs: a grant pairing another asked credential with another asked subject
+    other_ref = gov.add_reference(PROJECT, state="active")
+    gov.add_grant(PROJECT, state="active", credential_ref=other_ref, subject_ref="idp:t1:u2")
+    gov.add_grant(PROJECT, state="active", credential_ref=ref_id, subject_ref="idp:t1:u2")   # asked for by nobody
+    result = call(PROJECT, [], [], subject_grants=[(ref_id, SUBJECT), (other_ref, "idp:t1:u2")])
+    assert set(result["subject_grants"]) == {f"{ref_id}|{SUBJECT}", f"{other_ref}|idp:t1:u2"}
+    assert all(len(found) == 1 for found in result["subject_grants"].values())
+
+
+def test_subject_grants_are_bounded_and_malformed_pairs_are_refused(gov, facts):
+    call, method = facts
+    assert method.MAX_SUBJECT_GRANT_ROWS == 64
+    with pytest.raises(ValueError):
+        call(PROJECT, [], [], subject_grants=[(uuid.uuid4(), SUBJECT)] * 65)
+    for bad in ([("not-a-uuid", SUBJECT)], [(uuid.uuid4(),)], [(uuid.uuid4(), "")], [(True, SUBJECT)], [(uuid.uuid4(), 5)]):
+        with pytest.raises(ValueError):
+            call(PROJECT, [], [], subject_grants=bad)
