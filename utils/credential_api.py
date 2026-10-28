@@ -25,6 +25,7 @@ from tools import auth, config as c
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from . import credential_queries as queries
+from .credential_delegation import AUTH_MODE as DELEGATED_AUTH_MODE
 from .credential_errors import MESSAGES, CredentialTaskError
 from .credential_grants import grant_key_by_id, parse_valid_until, run_grant_action
 from .credential_material import (
@@ -71,14 +72,17 @@ SORT_ORDERS = ("asc", "desc")
 
 STATUS = {
     400: ("INVALID_REQUEST", "APPROVAL_REQUIRED", "CONFIGURATION_NOT_ELIGIBLE", "UNSUPPORTED_STORE_KIND",
-          "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER"),
-    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC", "OWNER_ONLY"),
+          "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER",
+          "INVALID_DESCRIPTOR", "UNSUPPORTED_PROVIDER"),
+    403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC", "OWNER_ONLY",
+          "DELEGATED_OWNER_PROBE"),
     404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
           "IMPORT_IN_FLIGHT", "CONFIGURATION_CHANGED", "MATERIAL_MISMATCH", "NO_SECRET_FIELDS", "SECRET_UNRESOLVED",
           "MANDATE_INACTIVE", "SUBJECT_UNLINKED", "STORE_VERSION_CONFLICT", "MIGRATION_REQUIRED", "OWNER_UNLINKED",
-          "PERSONAL_ONLY", "USE_PERSONAL_VALUE", "SUBJECT_NOT_OWNER", "CHECK_CONNECTION_FAILED"),
+          "PERSONAL_ONLY", "USE_PERSONAL_VALUE", "SUBJECT_NOT_OWNER", "CHECK_CONNECTION_FAILED",
+          "DELEGATED_SECRET_PRESENT", "DELEGATED_NO_VALUE", "DELEGATION_PROBE_FAILED", "OAUTH_APP_UNAVAILABLE"),
     413: ("REQUEST_TOO_LARGE",),
     503: ("DEPENDENCY_UNAVAILABLE", "AUDIT_UNAVAILABLE", "CHECK_CONNECTION_REFUSED"),
 }
@@ -117,7 +121,10 @@ def result_reply(result, created=False):
             prefix = f"{code}: "
             text = str(result["error"])
             message = text[len(prefix):] if text.startswith(prefix) else MESSAGES["FAILED"]
-        return error_reply(code, message)
+        reply, status = error_reply(code, message)
+        if code == "DELEGATION_PROBE_FAILED" and isinstance(result.get("reason"), str):
+            reply["reason"] = result["reason"]   # the exchange's fixed code, for the hint the UI shows (#6756)
+        return reply, status
     body = {"ok": True}
     for key, value in result.items():
         if key == "dry_run":
@@ -267,9 +274,11 @@ class _Approval(_Body):
 
 class ReferenceCreate(_Body):
     configuration_uuid: StrictStr
-    store_kind: StrictStr
+    store_kind: Optional[StrictStr] = None     # required for a stored secret; an Entra-delegated reference stores nothing
     ownership_class: StrictStr
     owner_user_id: Optional[StrictInt] = None   # the owner of a personal reference: required for it, refused otherwise
+    auth_mode: Optional[StrictStr] = None       # ``entra_delegated`` (#6756 step 4); absent: a stored secret
+    delegation: Optional[Dict[StrictStr, Any]] = None   # the descriptor of an ``entra_delegated`` reference, and only of it
 
     _uuid = validator("configuration_uuid", allow_reuse=True)(_uuid_text)
 
@@ -285,9 +294,18 @@ class ReferenceCreate(_Body):
 
     @validator("store_kind")
     def _store_kind(cls, value):  # pylint: disable=E0213
-        if value not in ONBOARD_STORE_KINDS:
+        if value is not None and value not in ONBOARD_STORE_KINDS:
             raise ValueError("unsupported store kind")
         return value
+
+    @root_validator(skip_on_failure=True)
+    def _kind_and_its_fields(cls, values):  # pylint: disable=E0213
+        delegated = values.get("auth_mode") == DELEGATED_AUTH_MODE
+        if values.get("auth_mode") not in (None, DELEGATED_AUTH_MODE):
+            raise ValueError("unsupported auth mode")
+        if delegated == (values.get("store_kind") is not None) or delegated != (values.get("delegation") is not None):
+            raise ValueError("a delegated reference takes a descriptor and no store kind; a stored secret the reverse")
+        return values
 
     @validator("ownership_class")
     def _ownership_class(cls, value):  # pylint: disable=E0213
@@ -471,6 +489,8 @@ def create_reference(project_id):
               "store_kind": body.store_kind, "ownership_class": body.ownership_class, "dry_run": False}
     if body.owner_user_id is not None:
         values["owner_user_id"] = body.owner_user_id
+    if body.auth_mode is not None:
+        values.update(auth_mode=body.auth_mode, delegation=body.delegation, store_kind="database")
     return result_reply(run_reference_action(values, actor_id(), audit_code=True), created=True)
 
 
@@ -513,7 +533,7 @@ def put_material(project_id, ref_id, administration=True):
 
 
 # What the owner of a personal reference sees of it: no operators' names or approval details
-_OWN_REFERENCE_KEYS = ("id", "configuration", "provider", "ownership_class", "owner", "store_kind", "state", "generation",
+_OWN_REFERENCE_KEYS = ("id", "configuration", "provider", "auth_mode", "delegation", "ownership_class", "owner", "store_kind", "state", "generation",
                        "validated", "configuration_changed", "expires_at", "created_at", "updated_at")
 
 

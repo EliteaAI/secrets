@@ -71,6 +71,7 @@ _REFERENCE_COLUMNS = (
     _REF.id, _REF.configuration_uuid, _REF.configuration_generation, _REF.provider, _REF.ownership_class,
     _REF.custodian_ref, _REF.store_kind, _REF.state, _REF.generation, _REF.validated_generation, _REF.approval_ref,
     _REF.policy_revision, _REF.created_by, _REF.approved_by, _REF.written_by, _REF.expires_at, _REF.created_at, _REF.updated_at,
+    _REF.auth_mode, _REF.capabilities,
 )
 _GRANT = CredentialUseGrant
 _GRANT_COLUMNS = (
@@ -325,6 +326,9 @@ def _present_references(rows):
             "id": str(row.id),
             "configuration": {"uuid": str(row.configuration_uuid), "title": row.configuration_title},
             "provider": row.provider,
+            "auth_mode": row.auth_mode,
+            # the descriptor of an Entra-delegated reference: which app, tenant, resource and scopes (no secret in it)
+            "delegation": (row.capabilities or {}).get("delegation") if row.auth_mode == "entra_delegated" else None,
             "ownership_class": row.ownership_class,
             "owner": _user(users, _owner_id(row.custodian_ref)),
             "store_kind": row.store_kind,

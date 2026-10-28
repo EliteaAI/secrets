@@ -222,7 +222,7 @@ def normalized(events):
 REFERENCE_ROW_KEYS = {
     "id", "configuration", "provider", "ownership_class", "owner", "store_kind", "state", "generation", "validated",
     "configuration_changed", "approval_ref", "policy_revision", "created_by", "approved_by", "written_by", "expires_at",
-    "created_at", "updated_at"}
+    "created_at", "updated_at", "auth_mode", "delegation"}   # the kind and its descriptor (#6756 step 4)
 GRANT_ROW_KEYS = {
     "id", "binding", "toolkit", "credential", "subject", "state", "valid_from", "valid_until", "approval_ref",
     "created_by", "approved_by", "revocation_epoch"}

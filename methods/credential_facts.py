@@ -128,7 +128,8 @@ def _present(row) -> dict:
         "configuration_generation": row.configuration_generation, "store_kind": row.store_kind,
         "ownership_class": row.ownership_class, "revocation_epoch": row.revocation_epoch,
         "custodian_user_id": _custodian_user_id(row.custodian_ref),
-        "custodian_subject_ref": _custodian_subject(row.custodian_ref)}
+        "custodian_subject_ref": _custodian_subject(row.custodian_ref),
+        "auth_mode": row.auth_mode}   # ``entra_delegated``: no value, a token is minted at release (#6756 step 4)
     if row.ownership_class == "personal" and row.state != "active":
         facts["note"] = f"personal reference {row.state}: runs of its owner are refused until it is active"
     return facts

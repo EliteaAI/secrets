@@ -1267,7 +1267,8 @@ def test_the_owners_list_is_metadata_without_operators_or_approvals(w):
     w.lifecycle(ref)
     [row] = mine(w, OWNER, mine="true")[0]["rows"]
     assert set(row) == {"id", "configuration", "provider", "ownership_class", "owner", "store_kind", "state", "generation",
-                        "validated", "configuration_changed", "expires_at", "created_at", "updated_at"}
+                        "validated", "configuration_changed", "expires_at", "created_at", "updated_at",
+                        "auth_mode", "delegation"}   # the kind and its descriptor (#6756 step 4)
     assert row["state"] == "active"
     text = json.dumps(row)
     for hidden in ("u10@x.test", "u20@x.test", "approval", "policy", "written_by", OWNER_SUBJECT, "store_locator", SECRET):

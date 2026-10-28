@@ -23,6 +23,7 @@ from sqlalchemy import select
 from tools import db, secret_stores
 
 from ..models.credential_governance import CredentialReference
+from .credential_delegation import DelegatedValue, is_delegated
 from .credential_onboarding import _store_ref
 
 RUN_STATES = frozenset({"active"})
@@ -95,10 +96,15 @@ def release_materials(  # pylint: disable=R0913
             return _refused("CREDENTIAL_REFERENCE_INACTIVE", ref_uuid)
         if ref.generation != generation:
             return _refused("CREDENTIAL_GENERATION_MISMATCH", ref_uuid)
-    by_kind = {}
+    by_kind, read = {}, {}
     for ref_uuid in wanted:
+        if is_delegated(found[ref_uuid]):   # a container (#6756 step 4): its descriptor, no store read
+            try:
+                read[ref_uuid] = DelegatedValue(found[ref_uuid])
+            except Exception:  # pylint: disable=W0703  # a descriptor that does not validate is not released
+                return _refused("CREDENTIAL_REFERENCE_INACTIVE", ref_uuid)
+            continue
         by_kind.setdefault(found[ref_uuid].store_kind, []).append(ref_uuid)
-    read = {}
     for store_kind, ref_uuids in by_kind.items():
         try:
             got = secret_stores.get_store(store_kind, governed=True).read_many(

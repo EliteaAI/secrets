@@ -29,6 +29,7 @@ from tools import auth, config as c, secret_stores, this
 
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger
 from . import credential_audit as audit
+from . import credential_delegation as delegation
 from .credential_errors import CredentialTaskError, require_actor, store_error_result
 from .credential_queries import subject_ref_of_user
 from .credential_schema import personal_schema_applied, project_tx
@@ -270,14 +271,25 @@ def _owner_custodian(project_id, owner_user_id) -> dict:
 
 # --- actions -------------------------------------------------------------------------------------
 
-def _create(values, actor):
+def _create(values, actor):  # pylint: disable=R0914
     project_id = values["project_id"]
+    delegated = values.get("auth_mode") == delegation.AUTH_MODE
+    descriptor = delegation.parse_descriptor(values.get("delegation")) if delegated else None
     facts = _configuration_facts(project_id, values["configuration_uuid"])
     if facts is None:
         raise CredentialTaskError("CONFIGURATION_NOT_FOUND")
     if facts.get("section") != "credentials" or facts.get("project_id") != project_id:
         raise CredentialTaskError("CONFIGURATION_NOT_ELIGIBLE")
-    secret_stores.get_store(values["store_kind"], governed=True)  # a store that cannot be used is refused now
+    if delegated:   # a container (#6756 step 4): the configuration holds no secret value, and nothing is stored
+        if facts.get("type") not in delegation.PROVIDERS:
+            raise CredentialTaskError("UNSUPPORTED_PROVIDER")
+        delegation.require_app(project_id, descriptor)
+        correlation = audit.new_event_id()
+        delegation.require_container(lambda: _read_bundle(project_id, facts["id"], secret_stores.CredentialStoreProvider.mint(
+            "onboard", decision_id=correlation, actor_ref=audit.operator_ref(actor), project_id=project_id,
+            ref_id=uuid.uuid4())))
+    else:
+        secret_stores.get_store(values["store_kind"], governed=True)  # a store that cannot be used is refused now
     personal = values["ownership_class"] == "personal"
     custodian = _owner_custodian(project_id, values["owner_user_id"]) if personal else None
     live = select(CredentialReference.id).where(
@@ -292,7 +304,8 @@ def _create(values, actor):
             with project_tx(project_id) as session:
                 if not personal_schema_applied(session):
                     raise CredentialTaskError("MIGRATION_REQUIRED")
-        return {"dry_run": True, "action": "create", "state": "pending", "provider": facts["type"]}
+        return {"dry_run": True, "action": "create", "state": "pending", "provider": facts["type"],
+                **({"auth_mode": delegation.AUTH_MODE} if delegated else {})}
     with project_tx(project_id) as session:
         if personal and not personal_schema_applied(session):   # the old index would allow one reference per configuration
             raise CredentialTaskError("MIGRATION_REQUIRED")
@@ -301,8 +314,12 @@ def _create(values, actor):
         row = CredentialReference(
             project_id=project_id, configuration_id=facts["id"],
             configuration_uuid=uuid.UUID(values["configuration_uuid"]), provider=facts["type"],
-            auth_mode="static_secret", ownership_class=values["ownership_class"], custodian_ref=custodian,
-            store_kind=values["store_kind"], store_locator=_locator(values["store_kind"]), generation=0,
+            auth_mode=delegation.AUTH_MODE if delegated else delegation.STATIC_AUTH_MODE,
+            ownership_class=values["ownership_class"], custodian_ref=custodian,
+            store_kind=values["store_kind"], store_locator=_locator(values["store_kind"]),
+            # a container has its one generation from the start: no value is ever written, so none follows
+            generation=1 if delegated else 0, configuration_generation=facts.get("generation") if delegated else None,
+            capabilities={delegation.CAPABILITY_KEY: descriptor} if delegated else {},
             state="pending", created_by=actor, state_changed_by=actor,
         )
         session.add(row)
@@ -312,15 +329,19 @@ def _create(values, actor):
             session.rollback()
             raise CredentialTaskError("REFERENCE_EXISTS") from None
         audit.record(session, _event(
-            "CREDENTIAL_REF_PENDING", row, actor, credential_generation=0, outcome="success", revocation_epoch=0))
+            "CREDENTIAL_REF_PENDING", row, actor, credential_generation=row.generation, outcome="success",
+            revocation_epoch=0))
         session.commit()
-        return {"action": "create", "reference": str(row.id), "state": "pending", "dry_run": False}
+        return {"action": "create", "reference": str(row.id), "state": "pending", "dry_run": False,
+                **({"auth_mode": delegation.AUTH_MODE} if delegated else {})}
 
 
 def _import(values, actor):  # pylint: disable=R0914
     project_id = values["project_id"]
     with project_tx(project_id) as session:
         ref = _load(session, project_id, values["ref"])
+        if delegation.is_delegated(ref):   # a container: there is nothing to import
+            raise CredentialTaskError("DELEGATED_NO_VALUE")
         if ref.ownership_class == "personal":   # the configuration holds the shared value, not this user's
             raise CredentialTaskError("USE_PERSONAL_VALUE")
         if ref.state not in ("pending", "validated"):
@@ -428,11 +449,66 @@ def _check_connection(project_id, ref, actor):
     raise CredentialTaskError("CHECK_CONNECTION_REFUSED" if answer.get("code") else "CHECK_CONNECTION_FAILED")
 
 
+class _DelegatedProbe(Exception):
+    """The reference probed is Entra-delegated: it has no store to look at (``_probe_delegated``)."""
+
+    def __init__(self, ref):
+        super().__init__("delegated")
+        self.ref = ref
+
+
+def _probe_any(values, actor):
+    try:
+        return _probe(values, actor)
+    except _DelegatedProbe as found:
+        return _probe_delegated(values, actor, found.ref)
+
+
+def _probe_delegated(values, actor, ref):
+    """The probe of an Entra-delegated reference (#6756 step 4): can its custodian (a personal one, probed by that
+    person only: it uses their sign-in) or the operator (a project one) obtain a token through it now? A pending reference that passes becomes validated; the outcome is
+    audited with the exchange's own code. No store is touched, and the token never reaches this plugin."""
+    project_id = values["project_id"]
+    if ref.state not in ("pending", "validated", "active"):
+        raise CredentialTaskError("INVALID_STATE")
+    person = actor
+    if ref.ownership_class == "personal":   # the custodian's own sign-in is tried by the custodian, nobody else
+        person = _custodian(ref).get("user_id")
+        if person is None or person != actor:
+            raise CredentialTaskError("DELEGATED_OWNER_PROBE")
+    if values["dry_run"]:
+        return {"dry_run": True, "action": "probe", "reference": values["ref"], "generation": ref.generation}
+    failure = None
+    try:
+        delegation.probe(ref, person)
+    except CredentialTaskError as exc:
+        failure = exc
+    state = ref.state
+    with project_tx(project_id) as session:
+        if failure is None and state == "pending":
+            if not transition_reference(session, ref.id, "pending", "validated", actor=actor,
+                                        validated_generation=ref.generation):
+                session.rollback()
+                raise CredentialTaskError("CONCURRENT_CHANGE")
+            state = "validated"
+        code = (getattr(failure, "reason", None) or failure.code) if failure else (
+            "CREDENTIAL_REF_VALIDATED" if state != ref.state else "CREDENTIAL_DELEGATION_PROBED")
+        audit.record(session, _event(code, ref, actor, event_type="probe", credential_generation=ref.generation,
+                                     outcome="failed" if failure else "success"))
+        session.commit()
+    if failure is not None:
+        return {**failure.result(), "reason": getattr(failure, "reason", failure.code)}
+    return {"action": "probe", "reference": values["ref"], "generation": ref.generation, "state": state,
+            "dry_run": False, "auth_mode": delegation.AUTH_MODE}
+
+
 def _probe(values, actor):  # pylint: disable=R0914
     project_id = values["project_id"]
     check = bool(values.get("check_connection"))
     with project_tx(project_id) as session:
         ref = _load(session, project_id, values["ref"])
+        if delegation.is_delegated(ref):
+            raise _DelegatedProbe(ref)   # the transaction ends untouched; probed on its own path
         if check and ref.ownership_class != "personal":
             raise CredentialTaskError("INVALID_REQUEST")
         if (ref.state not in (("pending", "validated", "active") if check else ("pending",)) or ref.generation < 1
@@ -565,7 +641,8 @@ def _move(values, actor):  # pylint: disable=R0914
             raise CredentialTaskError("INVALID_STATE")
         if values["dry_run"]:
             return {"dry_run": True, "action": action, "reference": values["ref"], "from": ref.state, "to": target}
-        has_material = target == "retired" and (ref.generation > 0 or ref.pending_generation is not None)
+        has_material = target == "retired" and not delegation.is_delegated(ref) and (
+            ref.generation > 0 or ref.pending_generation is not None)
         correlation = audit.new_event_id()
         if not transition_reference(session, ref.id, ref.state, target, actor=actor):
             session.rollback()
@@ -606,7 +683,7 @@ def _delete_material(project_id, ref, ledger_id, correlation, actor) -> bool:
 
 
 _ACTIONS = {
-    "create": _create, "import": _import, "probe": _probe, "approve": _approve, "activate": _activate,
+    "create": _create, "import": _import, "probe": _probe_any, "approve": _approve, "activate": _activate,
     "suspend": _move, "resume": _move, "retire": _move,
 }
 

@@ -39,6 +39,16 @@ MESSAGES = {
     "CHECK_CONNECTION_REFUSED": "The connection check could not be run for this credential.",
     "DENIED_RBAC": "You do not have permission to test saved credentials.",
     "OWNER_ONLY": "Only the owner of a personal credential can set its value.",
+    # Entra-delegated references (#6756 step 4): a container with no value
+    "INVALID_DESCRIPTOR": "The delegation descriptor is not valid: it takes the app, tenant, resource, scopes and "
+                          "assertion source only.",
+    "UNSUPPORTED_PROVIDER": "This kind of credential cannot act with a person's Microsoft sign-in.",
+    "DELEGATED_SECRET_PRESENT": "A credential that acts with a person's Microsoft sign-in holds no secret; remove the "
+                                "secret values from the configuration first.",
+    "DELEGATED_NO_VALUE": "A credential that acts with a person's Microsoft sign-in takes no value.",
+    "OAUTH_APP_UNAVAILABLE": "The Microsoft app this credential would exchange through is not available.",
+    "DELEGATED_OWNER_PROBE": "A credential that acts with someone's Microsoft sign-in is tried by its owner only.",
+    "DELEGATION_PROBE_FAILED": "A token could not be obtained with this sign-in now; see the audit event for the reason.",
     # REST API only (#7119)
     "INVALID_REQUEST": "The request is not valid.",
     "REQUEST_TOO_LARGE": "The request is too large.",

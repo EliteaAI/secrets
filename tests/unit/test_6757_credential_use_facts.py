@@ -28,7 +28,7 @@ def test_references_are_keyed_by_configuration_id_with_the_documented_shape(gov,
     assert result == {"references": {row.configuration_id: {
         "ref_id": str(ref_id), "state": "active", "generation": 1, "configuration_generation": 4,
         "store_kind": "corporate_vault", "ownership_class": "service", "revocation_epoch": 2,
-        "custodian_user_id": None, "custodian_subject_ref": None}}, "grants": {}}
+        "custodian_user_id": None, "custodian_subject_ref": None, "auth_mode": "static_secret"}}, "grants": {}}
 
 
 def test_ref_ids_find_the_same_rows_and_the_selectors_combine(gov, facts):

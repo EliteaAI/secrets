@@ -23,6 +23,7 @@ from pydantic import SecretStr
 from tools import secret_stores, this
 
 from . import credential_audit as audit
+from .credential_delegation import AUTH_MODE as DELEGATED_AUTH_MODE
 from .credential_errors import CredentialTaskError, require_actor, store_error_result
 from .credential_onboarding import (
     _configuration_facts, _event, _import_failed, _load, _open_ledger, write_to_store,
@@ -101,6 +102,8 @@ def _check_names(fields, paths):
 
 def _require_writable(ref, expected_generation):
     """A personal reference that is not in use (pending, validated or suspended), at the generation the caller saw."""
+    if getattr(ref, "auth_mode", None) == DELEGATED_AUTH_MODE:   # a container: no value, ever (#6756 step 4)
+        raise CredentialTaskError("DELEGATED_NO_VALUE")
     if ref.ownership_class != "personal":
         raise CredentialTaskError("PERSONAL_ONLY")
     if ref.state not in WRITABLE_STATES:
