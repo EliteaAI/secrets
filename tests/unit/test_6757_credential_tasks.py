@@ -12,7 +12,7 @@ from fixtures.governance import FIXTURE_VALUE
 from fixtures.permissions import effective_roles
 from run_tests import StubAuth, StubLog
 
-TABLES = ["credential_reference", "credential_use_grant", "credential_store_ledger"]
+TABLES = ["credential_reference", "credential_use_grant", "credential_store_ledger", "credential_offline_material"]
 USAGE = "project_id= is required. Format: project_id=<all|N>[;dry_run]"
 TASKS = ["create_credential_governance_tables", "manage_credential_reference", "manage_credential_grant",
          "reconcile_credential_store", "credential_store_smoke"]
@@ -64,7 +64,7 @@ def record_creates(monkeypatch, log, fail_for=()):
 
 # --- schema helpers ---------------------------------------------------------------------------------------------------
 
-def test_the_three_tables_are_created_per_project_in_one_transaction_and_only_if_missing(gov, schema, monkeypatch):
+def test_the_governance_tables_are_created_per_project_in_one_transaction_and_only_if_missing(gov, schema, monkeypatch):
     log = []
     use_sessions(gov, monkeypatch, log)
     record_creates(monkeypatch, log)
@@ -105,7 +105,7 @@ def test_the_guard_asks_the_catalog_once_and_decodes_project_ids(gov, schema, mo
     (entry,) = [e for e in log if e[0] == "execute"]
     _, sql, params = entry
     assert "information_schema.tables" in sql and "p_[0-9]+" in sql and "'configuration'" in sql
-    assert params == {"names": TABLES, "expected": 3}
+    assert params == {"names": TABLES, "expected": 4}
 
 
 def test_nothing_to_do_means_no_ddl_at_boot(gov, schema, monkeypatch):

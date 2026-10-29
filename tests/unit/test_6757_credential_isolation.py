@@ -125,7 +125,8 @@ def test_the_existing_api_layers_never_mention_the_store_or_the_engine():
     assert checked >= 8
 
 
-CUSTODY_MODULES = ("utils/credential_onboarding.py", "utils/credential_reconcile.py", "utils/credential_release.py")
+CUSTODY_MODULES = ("utils/credential_onboarding.py", "utils/credential_reconcile.py", "utils/credential_release.py",
+                   "utils/credential_offline_material.py")   # a mandate owner's offline consent (#7131)
 
 
 def mint_users(tree):
@@ -146,10 +147,11 @@ def test_the_mint_lint_catches_a_stray_caller():
 
 
 STORE_CALLS = {  # store method -> the only modules that may call it
-    "write": {"utils/credential_onboarding.py"},
-    "read": {"utils/credential_onboarding.py", "utils/credential_release.py"},
+    "write": {"utils/credential_onboarding.py", "utils/credential_offline_material.py"},
+    "read": {"utils/credential_onboarding.py", "utils/credential_release.py", "utils/credential_offline_material.py"},
     "metadata": {"utils/credential_onboarding.py", "utils/credential_reconcile.py"},
-    "delete_all": {"utils/credential_onboarding.py", "utils/credential_reconcile.py"},
+    "delete_all": {"utils/credential_onboarding.py", "utils/credential_reconcile.py",
+                   "utils/credential_offline_material.py"},
     "smoke": {"utils/credential_reconcile.py"},
 }
 

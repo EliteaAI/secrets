@@ -29,6 +29,8 @@ SUBJECT_KINDS = ('user_delegation', 'mandate')
 GRANT_STATES = ('pending_approval', 'active', 'suspended', 'revoked')
 LEDGER_OPS = ('write', 'delete_all')
 LEDGER_STATES = ('intent', 'written', 'committed', 'abandoned')
+MATERIAL_STATES = ('pending', 'active', 'retired')
+MATERIAL_SOURCES = ('login', 'broker')   # which client redeems an offline grant: auth_oidc's custody source
 LEGACY_INDEX = 'uq_credential_reference_live_configuration'
 SHARED_INDEX = 'uq_credential_reference_live_shared'
 PERSONAL_INDEX = 'uq_credential_reference_live_personal'
@@ -41,6 +43,10 @@ REFERENCE_IMMUTABLE = frozenset({
 GRANT_IMMUTABLE = frozenset({
     'id', 'project_id', 'application_id', 'subject_kind', 'subject_ref', 'agent_binding_ref',
     'toolkit_instance_id', 'credential_ref', 'target_ref', 'created_by',
+})
+MATERIAL_IMMUTABLE = frozenset({
+    'id', 'project_id', 'holder_ref', 'custodian_user_id', 'custodian_subject_ref', 'source', 'store_kind',
+    'created_by',
 })
 _ONCE = frozenset({'approved_by', 'subject_user_id'})
 
@@ -182,6 +188,37 @@ class CredentialStoreLedger(db_tools.AbstractBaseMixin, db.Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class CredentialOfflineMaterial(db_tools.AbstractBaseMixin, db.Base):
+    """A person's offline delegated consent (#7131): the refresh token they gave one holder (an autonomous mandate,
+    ``mandate:<uuid>``) so its runs can act with their Microsoft sign-in while they are away. The token lives in the
+    governed store under this row's id, as ``generation``; the row holds who it belongs to (``custodian_*``, fixed at
+    consent), which client redeems it (``source``) and whether it may still be released. Never a value."""
+    __tablename__ = 'credential_offline_material'
+    __table_args__ = (
+        CheckConstraint(_in_list('state', MATERIAL_STATES), name='credential_offline_material_state_ck'),
+        CheckConstraint(_in_list('source', MATERIAL_SOURCES), name='credential_offline_material_source_ck'),
+        CheckConstraint(_in_list('store_kind', STORE_KINDS), name='credential_offline_material_store_kind_ck'),
+        CheckConstraint("state <> 'active' OR generation >= 1", name='credential_offline_material_active_ck'),
+        Index('ix_credential_offline_material_holder', 'holder_ref', 'state'),
+        {'schema': c.POSTGRES_TENANT_SCHEMA},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    holder_ref: Mapped[str] = mapped_column(String(160), nullable=False)
+    custodian_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    custodian_subject_ref: Mapped[str] = mapped_column(String(160), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    store_kind: Mapped[str] = mapped_column(String(16), nullable=False, default='database', server_default='database')
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default='pending', server_default='pending')
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    retired_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    retired_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 def _refuse_immutable_change(target, immutable):
     state = inspect(target)
     for name in immutable:
@@ -200,3 +237,8 @@ def _guard_reference(_mapper, _connection, target):
 @event.listens_for(CredentialUseGrant, 'before_update')
 def _guard_grant(_mapper, _connection, target):
     _refuse_immutable_change(target, GRANT_IMMUTABLE)
+
+
+@event.listens_for(CredentialOfflineMaterial, 'before_update')
+def _guard_material(_mapper, _connection, target):
+    _refuse_immutable_change(target, MATERIAL_IMMUTABLE)

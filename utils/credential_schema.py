@@ -21,10 +21,12 @@ from pylon.core.tools import log
 from tools import config as c, db
 
 from ..models.credential_governance import (
-    LEGACY_INDEX, PERSONAL_INDEX, SHARED_INDEX, CredentialReference, CredentialStoreLedger, CredentialUseGrant,
+    LEGACY_INDEX, PERSONAL_INDEX, SHARED_INDEX, CredentialOfflineMaterial, CredentialReference, CredentialStoreLedger,
+    CredentialUseGrant,
 )
 
-_MODELS = (CredentialReference, CredentialUseGrant, CredentialStoreLedger)
+# credential_offline_material (#7131) is created like the others: by create_all, the startup safety net and the task
+_MODELS = (CredentialReference, CredentialUseGrant, CredentialStoreLedger, CredentialOfflineMaterial)
 LOCK_TIMEOUT = "5s"
 RETRY_ATTEMPTS = 3   # the startup guard tries a project that hit the lock timeout again this many times ...
 RETRY_DELAY_S = 5    # ... this long after
@@ -148,7 +150,7 @@ def project_tx(project_id):
 
 
 def project_ids_missing_credential_tables():
-    """One catalog query: project schemas that lack any of the three tables."""
+    """One catalog query: project schemas that lack any of the governance tables."""
     params = {"names": [model.__tablename__ for model in _MODELS], "expected": len(_MODELS)}
     with db.get_session(None) as session:
         rows = session.execute(_MISSING_QUERY, params).fetchall()
