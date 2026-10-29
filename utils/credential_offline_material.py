@@ -18,6 +18,7 @@ A crash between the store write and the row leaves at most a ``pending`` row (ne
 does not name (never read); ``retire`` deletes every generation either way.
 """
 import uuid
+from datetime import datetime, timezone
 
 from pydantic import SecretStr
 from pylon.core.tools import log
@@ -33,6 +34,7 @@ STORE_KIND = "database"
 KEEP_GENERATIONS = 2
 MAX_TOKEN_CHARS = 16_384
 MAX_REF_CHARS = 160
+ROTATE_EVERY_S = 86_400   # at most one store write per day for a rotated token
 RETIRED_REASONS = ("CONSENT_WITHDRAWN", "CONSENT_REPLACED", "CONSENT_REFUSED", "HOLDER_REVOKED")
 
 
@@ -111,17 +113,21 @@ def keep(project_id, *, holder_ref, custodian_user_id, custodian_subject_ref, so
             _store_ref(material), secret_stores.SecretValue({FIELD: SecretStr(token)}, 1), expected_version=0,
             ctx=_mint("onboard", material, correlation, caller_ref))
         token = None
-        with project_tx(project_id) as session:
-            moved = session.execute(update(CredentialOfflineMaterial).where(
-                CredentialOfflineMaterial.id == material.id, CredentialOfflineMaterial.state == "pending",
-                CredentialOfflineMaterial.generation == 0,
-            ).values(state="active", generation=1, updated_at=func.now()).execution_options(
-                synchronize_session=False)).rowcount
-            if moved != 1:
-                raise _Refused("CONCURRENT_CHANGE")
-            audit.record(session, _event("lifecycle", "CREDENTIAL_OFFLINE_MATERIAL_KEPT", material, caller_ref,
-                                         event_id=correlation, credential_generation=1, outcome="success"))
-            session.commit()
+        try:
+            with project_tx(project_id) as session:
+                moved = session.execute(update(CredentialOfflineMaterial).where(
+                    CredentialOfflineMaterial.id == material.id, CredentialOfflineMaterial.state == "pending",
+                    CredentialOfflineMaterial.generation == 0,
+                ).values(state="active", generation=1, updated_at=func.now()).execution_options(
+                    synchronize_session=False)).rowcount
+                if moved != 1:
+                    raise _Refused("CONCURRENT_CHANGE")
+                audit.record(session, _event("lifecycle", "CREDENTIAL_OFFLINE_MATERIAL_KEPT", material, caller_ref,
+                                             event_id=correlation, credential_generation=1, outcome="success"))
+                session.commit()
+        except BaseException:   # written but not activated: the store copy goes (the row stays pending, unreleased)
+            _drop_unactivated(material, caller_ref)
+            raise
         return {"ok": True, "material_ref": str(material.id), "generation": 1}
     except _Refused as refused:
         return _refused(refused.code)
@@ -132,6 +138,25 @@ def keep(project_id, *, holder_ref, custodian_user_id, custodian_subject_ref, so
     except Exception as exc:  # pylint: disable=W0703
         log.error("offline material: keep failed (%s)", type(exc).__name__)
         return _refused("DEPENDENCY_UNAVAILABLE")
+
+
+def _drop_unactivated(material, caller_ref) -> None:
+    """A value written whose row could not be activated: delete the store copy and retire the row (best effort; the
+    row is pending, so it is never released either way)."""
+    try:
+        secret_stores.get_store(STORE_KIND, governed=True).delete_all(
+            _store_ref(material), _mint("retire", material, audit.new_event_id(), caller_ref))
+    except Exception as exc:  # pylint: disable=W0703
+        log.error("offline material: an unactivated value was not deleted (%s)", type(exc).__name__)
+    try:
+        with project_tx(material.project_id) as session:
+            session.execute(update(CredentialOfflineMaterial).where(
+                CredentialOfflineMaterial.id == material.id, CredentialOfflineMaterial.state == "pending",
+            ).values(state="retired", retired_reason="CONSENT_REPLACED", updated_at=func.now()).execution_options(
+                synchronize_session=False))
+            session.commit()
+    except Exception as exc:  # pylint: disable=W0703
+        log.error("offline material: an unactivated row was not retired (%s)", type(exc).__name__)
 
 
 def release(project_id, material_ref, *, holder_ref, custodian_subject_ref, release_id, actor_ref) -> dict:
@@ -163,17 +188,23 @@ def release(project_id, material_ref, *, holder_ref, custodian_subject_ref, rele
             "source": row.source, "generation": row.generation}
 
 
-def rotate(project_id, material_ref, *, expected_generation, refresh_token, caller_ref) -> dict:
+def rotate(project_id, material_ref, *, expected_generation, refresh_token, caller_ref, min_interval_s=ROTATE_EVERY_S,
+           now=None) -> dict:  # pylint: disable=R0913
     """Keep the refresh token the authority issued on a redemption as the next generation: ``{"ok": True,
-    "generation"}`` or ``{"ok": False, "reason_code"}`` (``CONCURRENT_CHANGE`` when another rotation or a retirement
-    won; the older generation is still the row's then). Written only while the row is ``active`` at
-    ``expected_generation``."""
+    "generation", "kept"}`` or ``{"ok": False, "reason_code"}`` (``CONCURRENT_CHANGE`` when another rotation or a
+    retirement won; the older generation is still the row's then). Written only while the row is ``active`` at
+    ``expected_generation``, and at most once per ``min_interval_s`` (the authority rotates on almost every redemption;
+    the token kept stays valid, so ``kept`` is False and nothing is written in between)."""
     try:
         token = _token(refresh_token)
         with project_tx(project_id) as session:
             row = _load(session, project_id, material_ref)
         if row is None or row.state != "active" or row.generation != expected_generation:
             raise _Refused("CONCURRENT_CHANGE")
+        changed = row.updated_at if row.updated_at is None or row.updated_at.tzinfo else \
+            row.updated_at.replace(tzinfo=timezone.utc)
+        if changed is not None and ((now or datetime.now(timezone.utc)) - changed).total_seconds() < min_interval_s:
+            return {"ok": True, "generation": row.generation, "kept": False}
         generation, correlation = expected_generation + 1, audit.new_event_id()
         store = secret_stores.get_store(row.store_kind, governed=True)
         store.write(_store_ref(row), secret_stores.SecretValue({FIELD: SecretStr(token)}, generation),
@@ -194,7 +225,7 @@ def rotate(project_id, material_ref, *, expected_generation, refresh_token, call
             store.prune(_store_ref(row), KEEP_GENERATIONS, _mint("reconcile", row, correlation, caller_ref))
         except Exception as exc:  # pylint: disable=W0703  # best effort: the next rotation prunes again
             log.error("offline material: prune failed (%s)", type(exc).__name__)
-        return {"ok": True, "generation": generation}
+        return {"ok": True, "generation": generation, "kept": True}
     except _Refused as refused:
         return _refused(refused.code)
     except secret_stores.StoreError as exc:

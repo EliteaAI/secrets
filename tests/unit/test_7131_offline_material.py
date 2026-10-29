@@ -120,10 +120,11 @@ def test_a_retirement_holds_even_when_the_store_copy_cannot_be_deleted(gov, om):
 def test_a_rotated_token_becomes_the_next_generation_and_older_ones_are_pruned(gov, om):
     ref = keep(om)["material_ref"]
     assert om.rotate(PROJECT, ref, expected_generation=1, refresh_token=SecretStr(ROTATED),
-                     caller_ref="elitea_core:release") == {"ok": True, "generation": 2}
+                     caller_ref="elitea_core:release", min_interval_s=0) == {"ok": True, "generation": 2, "kept": True}
     answer = release(om, ref)
     assert answer["refresh_token"].get_secret_value() == ROTATED and answer["generation"] == 2
-    om.rotate(PROJECT, ref, expected_generation=2, refresh_token=SecretStr(TOKEN + "-3"), caller_ref="x")
+    om.rotate(PROJECT, ref, expected_generation=2, refresh_token=SecretStr(TOKEN + "-3"), caller_ref="x",
+              min_interval_s=0)
     assert sorted(gov.stores.stores["database"].versions[uuid.UUID(ref)]) == [2, 3]
     assert [e["reason_code"] for e in gov.db.events(PROJECT)].count("CREDENTIAL_OFFLINE_MATERIAL_ROTATED") == 2
     assert ROTATED not in everything_said(gov)
@@ -131,11 +132,11 @@ def test_a_rotated_token_becomes_the_next_generation_and_older_ones_are_pruned(g
 
 def test_a_stale_or_retired_rotation_writes_nothing(gov, om):
     ref = keep(om)["material_ref"]
-    assert om.rotate(PROJECT, ref, expected_generation=5, refresh_token=SecretStr(ROTATED), caller_ref="x") == {
-        "ok": False, "reason_code": "CONCURRENT_CHANGE"}
+    assert om.rotate(PROJECT, ref, expected_generation=5, refresh_token=SecretStr(ROTATED), caller_ref="x",
+                     min_interval_s=0) == {"ok": False, "reason_code": "CONCURRENT_CHANGE"}
     om.retire(PROJECT, ref, reason="CONSENT_WITHDRAWN", caller_ref="x")
-    assert om.rotate(PROJECT, ref, expected_generation=1, refresh_token=SecretStr(ROTATED), caller_ref="x") == {
-        "ok": False, "reason_code": "CONCURRENT_CHANGE"}
+    assert om.rotate(PROJECT, ref, expected_generation=1, refresh_token=SecretStr(ROTATED), caller_ref="x",
+                     min_interval_s=0) == {"ok": False, "reason_code": "CONCURRENT_CHANGE"}
     assert uuid.UUID(ref) not in gov.stores.stores["database"].versions
 
 
@@ -146,8 +147,21 @@ def test_a_store_that_refuses_the_write_leaves_a_pending_row_that_is_never_relea
     assert (found["state"], found["generation"]) == ("pending", 0)
 
 
-def test_the_audit_trail_down_leaves_the_material_unreleasable(gov, om):
-    gov.tracing.fail = True
+def test_a_value_written_whose_row_cannot_be_activated_is_deleted_from_the_store(gov, om):
+    gov.tracing.fail = True   # the activation's audit event cannot be recorded
     assert keep(om) == {"ok": False, "reason_code": "AUDIT_UNAVAILABLE"}
     [found] = gov.db.execute(PROJECT, "SELECT * FROM tenant.credential_offline_material")
-    assert found["state"] == "pending"
+    assert found["state"] == "retired" and found["generation"] == 0
+    assert gov.stores.stores["database"].versions == {}   # nothing left at rest
+    assert [call[:2] for call in gov.stores.stores["database"].calls] == [("write", "onboard"), ("delete_all", "retire")]
+
+
+def test_a_rotation_is_kept_at_most_once_a_day(gov, om):
+    ref = keep(om)["material_ref"]
+    assert om.rotate(PROJECT, ref, expected_generation=1, refresh_token=SecretStr(ROTATED), caller_ref="x") == {
+        "ok": True, "generation": 1, "kept": False}   # just kept: the token in the store stays valid
+    assert gov.stores.stores["database"].calls[-1][0] == "write" and len(gov.stores.stores["database"].calls) == 1
+    later = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + \
+        __import__("datetime").timedelta(days=1, minutes=1)
+    assert om.rotate(PROJECT, ref, expected_generation=1, refresh_token=SecretStr(ROTATED), caller_ref="x",
+                     now=later)["kept"] is True
