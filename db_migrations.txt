@@ -11,3 +11,8 @@ Run admin task create_credential_governance_tables with param: project_id=all
 # MIGRATION_REQUIRED; every other class is unaffected. Idempotent. Run it again after this release.
 Run admin task create_credential_governance_tables with param: project_id=all;dry_run
 Run admin task create_credential_governance_tables with param: project_id=all
+# Issue #7131 (C-1009): a mandate owner's offline consent. credential_offline_material in every project schema (the
+# owner's refresh token lives in the governed store under the row's id, never in the row). The startup safety net
+# creates it for existing projects; create_credential_governance_tables reports/does the same. Nothing reads it unless
+# elitea_core's mandate_identity_sources allows owner_delegated.
+Run admin task create_credential_governance_tables with param: project_id=all;dry_run
