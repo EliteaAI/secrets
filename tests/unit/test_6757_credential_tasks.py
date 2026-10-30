@@ -146,7 +146,8 @@ class Module:
 
 @pytest.fixture
 def patch_schema(gov, schema, monkeypatch):
-    state = types.SimpleNamespace(missing=[1, 2, 5], applied=[], no_subject_column=[], column_applied=[])
+    state = types.SimpleNamespace(missing=[1, 2, 5], applied=[], no_subject_column=[], column_applied=[],
+                                  no_list_index=[], list_index_applied=[])
 
     def apply(ids, dry_run=False):
         state.applied.append((list(ids), dry_run))
@@ -159,6 +160,12 @@ def patch_schema(gov, schema, monkeypatch):
     monkeypatch.setattr(schema, "apply_credential_tables", apply)
     monkeypatch.setattr(schema, "project_ids_missing_grant_subject_user_id", lambda: list(state.no_subject_column))
     monkeypatch.setattr(schema, "apply_grant_subject_user_id", apply_column)
+
+    def apply_list_index(ids, dry_run=False):
+        state.list_index_applied.append((list(ids), dry_run))
+        return list(ids), []
+    monkeypatch.setattr(schema, "project_ids_missing_grant_list_index", lambda: list(state.no_list_index))
+    monkeypatch.setattr(schema, "apply_grant_list_index", apply_list_index)
     return state
 
 
@@ -167,8 +174,19 @@ def test_the_task_creates_the_missing_tables_everywhere(tasks, patch_schema):
     result = tasks.create_credential_governance_tables(module, param="project_id=all")
     assert result == {"migrated": 3, "failed": 0, "failed_projects": [], "dry_run": False,
                       "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []},
-                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []}}
+                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []},
+                      "grant_list_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
     assert patch_schema.applied == [([1, 2, 5], False)] and module.listed == [{"create_success": True}]
+
+
+def test_the_task_builds_the_grants_list_index_in_the_targeted_projects_only(tasks, patch_schema):
+    patch_schema.missing = []
+    patch_schema.no_list_index = [1, 2, 9]
+    result = tasks.create_credential_governance_tables(Module(), param="project_id=all")
+    assert result["grant_list_index"] == {"migrated": 2, "failed": 0, "failed_projects": []}
+    assert patch_schema.list_index_applied == [([1, 2], False)]   # project 9 is not in the project list
+    dry = tasks.create_credential_governance_tables(Module(), param="project_id=1;dry_run")
+    assert dry["grant_list_index"]["migrated"] == 1 and patch_schema.list_index_applied[-1] == ([1], True)
 
 
 def test_the_task_adds_the_grant_subject_column_in_the_targeted_projects_only(tasks, patch_schema):
@@ -309,10 +327,12 @@ def test_a_registered_task_runs_the_method_on_the_module(gov, plugin, monkeypatc
     plugin.module.ready()
     monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_credential_tables", lambda: [])
     monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_grant_subject_user_id", lambda: [])
+    monkeypatch.setattr(gov.module("utils.credential_schema"), "project_ids_missing_grant_list_index", lambda: [])
     result = gov.admin.tasks["create_credential_governance_tables"](param="project_id=7;dry_run")
     assert result == {"migrated": 0, "failed": 0, "failed_projects": [], "dry_run": True,
                       "personal_index": {"migrated": 0, "failed": 0, "failed_projects": []},
-                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []}}
+                      "grant_subject_user_id": {"migrated": 0, "failed": 0, "failed_projects": []},
+                      "grant_list_index": {"migrated": 0, "failed": 0, "failed_projects": []}}
 
 
 def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
@@ -322,11 +342,13 @@ def test_a_failing_registration_does_not_break_ready(gov, plugin, monkeypatch):
     assert gov.admin.tasks == {}
 
 
-def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=(), ungranted=()):
+def run_guard(plugin, monkeypatch, gov, pending, apply=None, unwritten=(), ungranted=(), unindexed=()):
     monkeypatch.setattr(plugin.file, "Thread", lambda target, daemon: types.SimpleNamespace(start=target))
     schema = gov.module("utils.credential_schema")
     applied = []
-    plugin.written, plugin.granted = [], []
+    plugin.written, plugin.granted, plugin.indexed = [], [], []
+    monkeypatch.setattr(schema, "project_ids_missing_grant_list_index", lambda: list(unindexed))
+    monkeypatch.setattr(schema, "apply_grant_list_index", lambda ids: plugin.indexed.append(list(ids)) or (ids, []))
     monkeypatch.setattr(schema, "project_ids_missing_grant_subject_user_id", lambda: list(ungranted))
     monkeypatch.setattr(schema, "apply_grant_subject_user_id",
                         lambda ids: plugin.granted.append(list(ids)) or (ids, []))
@@ -360,6 +382,27 @@ def test_the_startup_guard_adds_the_grant_subject_column_where_it_is_missing(gov
     assert run_guard(plugin, monkeypatch, gov, [], ungranted=[3, 9]) == [] and plugin.granted == [[3, 9]]
     assert run_guard(plugin, monkeypatch, gov, [4], ungranted=[]) == [[4]] and plugin.granted == []   # tables first
     assert run_guard(plugin, monkeypatch, gov, [], ungranted=[]) == [] and plugin.granted == []        # steady state
+
+
+def test_the_startup_guard_builds_the_grants_list_index_where_it_is_missing(gov, plugin, monkeypatch):
+    assert run_guard(plugin, monkeypatch, gov, [], unindexed=[3, 9]) == [] and plugin.indexed == [[3, 9]]
+    assert run_guard(plugin, monkeypatch, gov, [], unindexed=[]) == [] and plugin.indexed == []   # steady state
+
+
+def _grant_indexes(gov, project_id):
+    return {row["name"] for row in gov.db.execute(
+        project_id, "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'credential_use_grant'")}
+
+
+def test_the_grants_list_index_is_built_once_and_a_dry_run_changes_nothing(gov, schema):
+    name = gov.module("models.credential_governance").GRANT_LIST_INDEX
+    assert name in _grant_indexes(gov, 3)   # new projects get it from create_all
+    gov.db.execute(3, f"DROP INDEX tenant.{name}")
+    assert schema.apply_grant_list_index([3], dry_run=True) == ([3], [])
+    assert name not in _grant_indexes(gov, 3)
+    assert schema.apply_grant_list_index([3]) == ([3], [])
+    assert name in _grant_indexes(gov, 3)
+    assert schema.apply_grant_list_index([3]) == ([3], [])   # idempotent
 
 
 def _grant_columns(gov, project_id):

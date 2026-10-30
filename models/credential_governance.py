@@ -32,6 +32,7 @@ LEDGER_STATES = ('intent', 'written', 'committed', 'abandoned')
 MATERIAL_STATES = ('pending', 'active', 'retired')
 MATERIAL_SOURCES = ('login', 'broker')   # which client redeems an offline grant: auth_oidc's custody source
 LEGACY_INDEX = 'uq_credential_reference_live_configuration'
+GRANT_LIST_INDEX = 'ix_credential_use_grant_list'
 SHARED_INDEX = 'uq_credential_reference_live_shared'
 PERSONAL_INDEX = 'uq_credential_reference_live_personal'
 
@@ -130,6 +131,8 @@ class CredentialUseGrant(db_tools.AbstractBaseMixin, db.Base):
         CheckConstraint('approved_by IS NULL OR approved_by <> created_by', name='credential_use_grant_approver_ck'),
         Index('ix_credential_use_grant_credential', 'credential_ref', 'state'),
         Index('ix_credential_use_grant_binding', 'agent_binding_ref', 'state'),
+        # the operator list (#7294): its filter and default order, so a page and its count read the index
+        Index(GRANT_LIST_INDEX, 'project_id', 'target_ref', 'updated_at'),
         {'schema': c.POSTGRES_TENANT_SCHEMA},
     )
 

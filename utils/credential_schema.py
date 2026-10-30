@@ -11,6 +11,9 @@ Personal credential references (#7119) need two changes to a project that predat
 
 ``credential_use_grant.subject_user_id`` (the user a grant's subject was resolved from; perf review 2026-10-21, S5) is
 the ``grant_subject_user_id`` step: additive like ``written_by``, applied by the startup safety net and by the task.
+
+The grants list index (``ix_credential_use_grant_list``: project, target, updated_at; #7294) is the ``grant_list_index``
+step: additive, built where it is missing by the startup safety net and by the task, waiting at most ``LOCK_TIMEOUT``.
 """
 import time
 from contextlib import contextmanager
@@ -21,8 +24,8 @@ from pylon.core.tools import log
 from tools import config as c, db
 
 from ..models.credential_governance import (
-    LEGACY_INDEX, PERSONAL_INDEX, SHARED_INDEX, CredentialOfflineMaterial, CredentialReference, CredentialStoreLedger,
-    CredentialUseGrant,
+    GRANT_LIST_INDEX, LEGACY_INDEX, PERSONAL_INDEX, SHARED_INDEX, CredentialOfflineMaterial, CredentialReference,
+    CredentialStoreLedger, CredentialUseGrant,
 )
 
 # credential_offline_material (#7131) is created like the others: by create_all, the startup safety net and the task
@@ -57,6 +60,14 @@ _MISSING_GRANT_COLUMN_QUERY = text(
     "WHERE t.table_name = 'credential_use_grant' AND t.table_schema ~ '^p_[0-9]+$' "
     "AND NOT EXISTS (SELECT 1 FROM information_schema.columns x WHERE x.table_schema = t.table_schema "
     "AND x.table_name = 'credential_use_grant' AND x.column_name = 'subject_user_id')")
+
+
+# Project schemas that have credential_use_grant but not the grants list index
+_MISSING_GRANT_INDEX_QUERY = text(
+    "SELECT t.table_schema FROM information_schema.tables t "
+    "WHERE t.table_name = 'credential_use_grant' AND t.table_schema ~ '^p_[0-9]+$' "
+    "AND NOT EXISTS (SELECT 1 FROM pg_indexes x WHERE x.schemaname = t.table_schema "
+    "AND x.tablename = 'credential_use_grant' AND x.indexname = :name)")
 
 
 def _new_indexes():
@@ -253,6 +264,36 @@ def apply_grant_subject_user_id(project_ids, dry_run=False):
             migrated.append(pid)
         except Exception:  # pylint: disable=W0703
             log.exception("credential governance schema: failed to add subject_user_id to project %s", pid)
+            failed.append({"project_id": pid})
+    return migrated, failed
+
+
+def project_ids_missing_grant_list_index():
+    """One catalog query: project schemas whose ``credential_use_grant`` has no grants list index yet."""
+    with db.get_session(None) as session:
+        rows = session.execute(_MISSING_GRANT_INDEX_QUERY, {"name": GRANT_LIST_INDEX}).fetchall()
+    return [int(row[0][2:]) for row in rows]
+
+
+def apply_grant_list_index(project_ids, dry_run=False):
+    """Build the grants list index where it is missing (``grant_list_index`` step; additive and idempotent), one
+    transaction per project that waits at most ``LOCK_TIMEOUT`` for the table. Returns ``(migrated, failed)``; on a dry
+    run ``migrated`` is what would be built."""
+    migrated, failed = [], []
+    index = next(item for item in CredentialUseGrant.__table__.indexes if item.name == GRANT_LIST_INDEX)
+    for pid in project_ids:
+        if dry_run:
+            migrated.append(pid)
+            continue
+        try:
+            with db.get_session(pid) as session:
+                connection = session.connection()
+                _set_lock_timeout(connection)
+                index.create(connection, checkfirst=True)
+                session.commit()
+            migrated.append(pid)
+        except Exception:  # pylint: disable=W0703
+            log.exception("credential governance schema: failed to build the grants list index of project %s", pid)
             failed.append({"project_id": pid})
     return migrated, failed
 
