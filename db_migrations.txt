@@ -16,3 +16,8 @@ Run admin task create_credential_governance_tables with param: project_id=all
 # creates it for existing projects; create_credential_governance_tables reports/does the same. Nothing reads it unless
 # elitea_core's mandate_identity_sources allows owner_delegated.
 Run admin task create_credential_governance_tables with param: project_id=all;dry_run
+# Issue #7294 (C-1009 performance pass): the grants list index ix_credential_use_grant_list (project_id, target_ref,
+# updated_at) on credential_use_grant. Additive. The startup safety net builds it where it is missing (each project waits
+# at most 5 s for its table and is retried); create_credential_governance_tables reports/does the same (grant_list_index).
+Run admin task create_credential_governance_tables with param: project_id=all;dry_run
+Run admin task create_credential_governance_tables with param: project_id=all

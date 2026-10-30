@@ -152,9 +152,9 @@ class Module(module.ModuleModel):
         def _run():
             try:
                 from .utils.credential_schema import (  # pylint: disable=C0415
-                    apply_credential_tables, apply_grant_subject_user_id, apply_with_retry, apply_written_by,
-                    project_ids_missing_credential_tables, project_ids_missing_grant_subject_user_id,
-                    project_ids_missing_written_by,
+                    apply_credential_tables, apply_grant_list_index, apply_grant_subject_user_id, apply_with_retry,
+                    apply_written_by, project_ids_missing_credential_tables, project_ids_missing_grant_list_index,
+                    project_ids_missing_grant_subject_user_id, project_ids_missing_written_by,
                 )
             except Exception:  # pylint: disable=W0703
                 log.exception("credential governance schema: auto-migration failed")
@@ -166,6 +166,8 @@ class Module(module.ModuleModel):
                   lambda ids: apply_with_retry(apply_written_by, ids))
             _step("subject_user_id added", project_ids_missing_grant_subject_user_id,
                   lambda ids: apply_with_retry(apply_grant_subject_user_id, ids))
+            _step("grants list index built", project_ids_missing_grant_list_index,   # #7294: additive
+                  lambda ids: apply_with_retry(apply_grant_list_index, ids))
 
         Thread(target=_run, daemon=True).start()
 
