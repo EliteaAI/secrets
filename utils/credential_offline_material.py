@@ -4,7 +4,8 @@ When the owner of an autonomous mandate consents to its runs acting with their M
 one refresh token for it (auth_oidc) and keeps it here, as that person's personal material (class B): in the governed
 store under the row's id, never in a row, an event, a result or a log line. The row says whose it is
 (``custodian_user_id``, ``custodian_subject_ref`` = ``idp:<tid>:<oid>``, fixed at consent), which holder it was given to
-(``holder_ref``, ``mandate:<uuid>``) and which client redeems it (``source``).
+(``holder_ref``: ``mandate:<uuid>``, or ``token:<id>`` for a scoped API token, #7337; one holder never matches
+another) and which client redeems it (``source``).
 
 - ``keep``: a new row ``pending`` and generation 0, the store write of generation 1, then ``active`` with its event.
 - ``release``: the token of an ``active`` row, only for its own holder and custodian (the caller names both; any
@@ -35,7 +36,8 @@ KEEP_GENERATIONS = 2
 MAX_TOKEN_CHARS = 16_384
 MAX_REF_CHARS = 160
 ROTATE_EVERY_S = 86_400   # at most one store write per day for a rotated token
-RETIRED_REASONS = ("CONSENT_WITHDRAWN", "CONSENT_REPLACED", "CONSENT_REFUSED", "HOLDER_REVOKED")
+# OWNER_RETIRED (#7337): the holder's owner was deleted or suspended (a scoped API token's consent swept up)
+RETIRED_REASONS = ("CONSENT_WITHDRAWN", "CONSENT_REPLACED", "CONSENT_REFUSED", "HOLDER_REVOKED", "OWNER_RETIRED")
 
 
 class _Refused(Exception):
@@ -70,11 +72,14 @@ def _mint(purpose, row, decision_id, actor_ref):
 
 
 def _event(event_type, reason_code, row, caller_ref, **fields):
+    """The audit event of a material: its custodian as the user; its holder as the mandate (``mandate:<uuid>``) or, for
+    a scoped API token (``token:<id>``, #7337), as the target."""
     holder = row.holder_ref
     return audit.build_event(
         event_type, reason_code, project_id=row.project_id, actor_user_id=None, caller_ref=caller_ref,
         credential_ref=row.id, user_ref=row.custodian_subject_ref,
-        mandate_ref=holder[len("mandate:"):] if holder.startswith("mandate:") else None, **fields)
+        mandate_ref=holder[len("mandate:"):] if holder.startswith("mandate:") else None,
+        target_ref=holder if holder.startswith("token:") else None, **fields)
 
 
 def _load(session, project_id, material_ref):

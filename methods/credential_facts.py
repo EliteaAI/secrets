@@ -16,9 +16,10 @@ references is capped at ``MAX_SELECTORS`` rows, so one crowded configuration can
 ``ref_ids`` are keyed by configuration id, so two references of one configuration asked for together return one.
 """
 import uuid
+from datetime import datetime, timezone
 
 from pylon.core.tools import web
-from sqlalchemy import and_, false, or_, select
+from sqlalchemy import and_, exists, false, or_, select
 from tools import db  # pylint: disable=E0401
 
 from ..models.credential_governance import CredentialReference, CredentialUseGrant
@@ -177,6 +178,35 @@ class Method:
     def credential_facts_version(self) -> int:
         """The shape version of ``credential_use_facts`` (a startup check reads it; undecorated attributes do not bind)."""
         return CREDENTIAL_FACTS_VERSION
+
+    @web.method()
+    def delegated_references_of(self, project_id: int, subject_ref: str, user_id: int) -> list:
+        """The active Entra-delegated references of the project a person may use (#7337, what a scoped token's owner
+        may name in their consent): their own personal ones (custodian), and the shared ones on which they hold an
+        active grant in force (any binding, any toolkit). ``[{ref_id, configuration_id, configuration_uuid,
+        generation, configuration_generation, ownership_class}]``, oldest first, at most ``MAX_SELECTORS``. One
+        session, one statement. Metadata only: no secret, no store locator, nothing about other people's references."""
+        _caller_subject(subject_ref, user_id)
+        if subject_ref is None or user_id is None:
+            raise ValueError("subject_ref and user_id are both needed")
+        now = datetime.now(timezone.utc)
+        own = and_(CredentialReference.ownership_class == "personal", or_(
+            CredentialReference.custodian_ref["subject_ref"].as_string() == subject_ref,
+            CredentialReference.custodian_ref["user_id"].as_integer() == user_id))
+        granted = and_(CredentialReference.ownership_class != "personal", exists().where(
+            CredentialUseGrant.project_id == project_id, CredentialUseGrant.credential_ref == CredentialReference.id,
+            CredentialUseGrant.state == "active", CredentialUseGrant.subject_ref == subject_ref,
+            CredentialUseGrant.valid_from <= now,
+            or_(CredentialUseGrant.valid_until.is_(None), CredentialUseGrant.valid_until > now)))
+        with db.get_session(project_id) as session:
+            rows = session.execute(select(CredentialReference).where(
+                CredentialReference.project_id == project_id, CredentialReference.state == "active",
+                CredentialReference.auth_mode == "entra_delegated", or_(own, granted),
+            ).order_by(CredentialReference.created_at, CredentialReference.id).limit(MAX_SELECTORS)).scalars().all()
+            return [{"ref_id": str(row.id), "configuration_id": row.configuration_id,
+                     "configuration_uuid": str(row.configuration_uuid), "generation": row.generation,
+                     "configuration_generation": row.configuration_generation,
+                     "ownership_class": row.ownership_class} for row in rows]
 
     @web.method()
     def credential_use_facts(  # pylint: disable=R0913
