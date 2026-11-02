@@ -201,3 +201,12 @@ def test_a_mandate_holders_events_are_unchanged(gov, om):
     om.retire(PROJECT, ref, reason="CONSENT_WITHDRAWN", caller_ref="user:9")
     for event in gov.db.events(PROJECT):
         assert "target_ref" not in event and event["mandate_ref"] == HOLDER[8:]
+
+
+def test_a_material_of_a_gone_owner_is_retired_with_its_own_reason(gov, om):
+    ref = keep(om, holder_ref=TOKEN_HOLDER)["material_ref"]
+    assert om.retire(PROJECT, ref, reason="OWNER_RETIRED", caller_ref="elitea_core:token_consent_sweep") == {
+        "ok": True, "retired": True}
+    assert row(gov, ref)["retired_reason"] == "OWNER_RETIRED"
+    assert release(om, ref, holder_ref=TOKEN_HOLDER) == {"ok": False, "reason_code": "OFFLINE_MATERIAL_INACTIVE"}
+    assert om.retire(PROJECT, ref, reason="SOMETHING_ELSE", caller_ref="x") == {"ok": False, "reason_code": "INVALID_REQUEST"}

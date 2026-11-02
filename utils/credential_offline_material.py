@@ -36,7 +36,8 @@ KEEP_GENERATIONS = 2
 MAX_TOKEN_CHARS = 16_384
 MAX_REF_CHARS = 160
 ROTATE_EVERY_S = 86_400   # at most one store write per day for a rotated token
-RETIRED_REASONS = ("CONSENT_WITHDRAWN", "CONSENT_REPLACED", "CONSENT_REFUSED", "HOLDER_REVOKED")
+# OWNER_RETIRED (#7337): the holder's owner was deleted or suspended (a scoped API token's consent swept up)
+RETIRED_REASONS = ("CONSENT_WITHDRAWN", "CONSENT_REPLACED", "CONSENT_REFUSED", "HOLDER_REVOKED", "OWNER_RETIRED")
 
 
 class _Refused(Exception):
