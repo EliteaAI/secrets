@@ -165,3 +165,39 @@ def test_a_rotation_is_kept_at_most_once_a_day(gov, om):
         __import__("datetime").timedelta(days=1, minutes=1)
     assert om.rotate(PROJECT, ref, expected_generation=1, refresh_token=SecretStr(ROTATED), caller_ref="x",
                      now=later)["kept"] is True
+
+
+# --- #7337: a scoped API token as the holder ---------------------------------------------------------------------------
+
+TOKEN_HOLDER = "token:21"
+
+
+def test_a_token_holder_is_kept_released_and_retired_as_a_mandate_is_and_named_as_the_target(gov, om):
+    ref = keep(om, holder_ref=TOKEN_HOLDER)["material_ref"]
+    answer = release(om, ref, holder_ref=TOKEN_HOLDER)
+    assert answer["ok"] is True and answer["refresh_token"].get_secret_value() == TOKEN
+    assert om.retire(PROJECT, ref, reason="HOLDER_REVOKED", caller_ref="elitea_core:token_deleted") == {
+        "ok": True, "retired": True}
+    assert release(om, ref, holder_ref=TOKEN_HOLDER) == {"ok": False, "reason_code": "OFFLINE_MATERIAL_INACTIVE"}
+    kept, retired = gov.db.events(PROJECT)
+    for event in (kept, retired):
+        assert (event["target_ref"], event["user_ref"], event.get("mandate_ref")) == (TOKEN_HOLDER, SUBJECT, None)
+    assert retired["reason_code"] == "CREDENTIAL_OFFLINE_MATERIAL_RETIRED"
+    assert row(gov, ref)["retired_reason"] == "HOLDER_REVOKED"
+    assert TOKEN not in everything_said(gov)
+
+
+def test_a_mandate_holder_never_matches_a_token_holder_and_back(gov, om):
+    mandate_ref = keep(om)["material_ref"]
+    token_ref = keep(om, holder_ref=TOKEN_HOLDER)["material_ref"]
+    for ref, other in ((mandate_ref, TOKEN_HOLDER), (token_ref, HOLDER), (token_ref, "token:22"),
+                       (token_ref, "mandate:21"), (mandate_ref, f"token:{HOLDER[8:]}")):
+        assert release(om, ref, holder_ref=other) == {"ok": False, "reason_code": "OFFLINE_MATERIAL_MISMATCH"}
+    assert [call[:2] for call in gov.stores.stores["database"].calls].count(("read", "release")) == 0
+
+
+def test_a_mandate_holders_events_are_unchanged(gov, om):
+    ref = keep(om)["material_ref"]
+    om.retire(PROJECT, ref, reason="CONSENT_WITHDRAWN", caller_ref="user:9")
+    for event in gov.db.events(PROJECT):
+        assert "target_ref" not in event and event["mandate_ref"] == HOLDER[8:]
