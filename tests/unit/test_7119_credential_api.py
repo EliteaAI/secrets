@@ -683,8 +683,8 @@ def test_every_endpoint_declares_its_permissions_and_the_operator_roles(rest, mo
         assert not any(effective["default"].values())  # the project mode does not see these endpoints at all
     handler = rest.mods[module]
     assert handler.API.mode_handlers["administration"] is handler.AdminAPI
-    # only the owner's own list has a default-mode handler here (#7119 PR 6); the rest is for operators
-    assert set(handler.API.mode_handlers) == ({"administration", "default"} if module == "credential_references" else {"administration"})
+    # (#7269) every route has a project (default) mode handler for the project's own admins
+    assert set(handler.API.mode_handlers) == {"administration", "default"}
 
 
 def test_the_route_shapes_match_the_design(rest):
@@ -883,7 +883,8 @@ def test_the_permissions_are_registered_for_the_operator_api(gov, monkeypatch):
     for name in ("credentials.view", "credentials.manage", "credentials.probe", "credentials.approve"):
         assert roles[name]["administration"] == operators, name
         assert roles[name]["default"]["system"] is False and roles[name]["default"]["editor"] is False, name
-    assert not any(roles["credentials.view"]["default"].values())
+    # (#7269) in project mode the project's admins (as manage; no project role is named super_admin)
+    assert {role for role, granted in roles["credentials.view"]["default"].items() if granted} == {"admin", "super_admin"}
     assert roles["credentials.manage"]["default"]["admin"] is True  # as before
     for modes in roles["credentials.reveal"].values():  # untouched, and read by no route
         assert not (modes["admin"] or modes["editor"] or modes["viewer"])

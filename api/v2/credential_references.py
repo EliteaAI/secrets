@@ -1,4 +1,9 @@
-"""Credential references of a project: list and create (#7119, C-1009). Metadata only, never the store locator."""
+"""Credential references of a project: list and create (#7119, C-1009). Metadata only, never the store locator.
+
+Project mode (#7269): ``mine=true`` is the owner's own list as before; without it, the project's admins get the
+administration list (``credentials.view`` in the project), each row saying whether it is escalated, while governance
+is enforced. Create stays in administration mode (and the member's request, elitea_core ``governance_requests``)."""
+from flask import request
 from tools import api_tools, auth, config as c, register_openapi
 
 from ...models.credential_governance import OWNERSHIP_CLASSES, REFERENCE_STATES, STORE_KINDS
@@ -19,9 +24,13 @@ class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         mcp_tool=False,
         available_to_users=False,
     )
+    # every member holds set_own_value: ``mine=true`` is their own list; anything else is the project list, for which
+    # the handler asks credentials.view in the project (#7269). Listing view here would recommend it to every member
     @auth.decorators.check_api({"permissions": [api.SET_OWN_VALUE], "recommended_roles": api.OWN_VALUE_ROLES})
     def get(self, project_id: int, **kwargs):  # pylint: disable=C0111
-        return api.respond(self.module, api.list_own_references, project_id)
+        if request.args.get("mine") == "true":
+            return api.respond(self.module, api.list_own_references, project_id)
+        return api.respond_in_project(self.module, api.VIEW, lambda pid: api.list_references(pid, True), project_id)
 
 
 class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
@@ -32,7 +41,7 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         parameters=[_PROJECT, *api.list_parameters(
             queries.REFERENCE_SORTS,
             ("state", "string", REFERENCE_STATES), ("ownership_class", "string", OWNERSHIP_CLASSES),
-            ("store_kind", "string", STORE_KINDS), ("owner_user_id", "integer", None))],
+            ("store_kind", "string", STORE_KINDS), ("owner_user_id", "integer", None), ("escalated", "boolean", None))],
         mcp_tool=False,
         available_to_users=False,
     )

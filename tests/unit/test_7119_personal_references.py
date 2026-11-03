@@ -1221,7 +1221,7 @@ def test_the_routes_declare_the_permissions_and_the_modes(w):
     assert set(material.API.mode_handlers) == {"default", "administration"}
     assert material.API.url_params == ["<int:project_id>/<uuid:ref_id>"]
     mine = StubAuth.decorators.requirements[f"{w.mods['credential_references'].__name__}:ProjectAPI.get"]
-    assert mine["permissions"] == [api.SET_OWN_VALUE]
+    assert mine["permissions"] == [api.SET_OWN_VALUE]   # (#7269) without mine=true the handler asks credentials.view
     assert set(w.mods["credential_references"].API.mode_handlers) == {"default", "administration"}
     for handler in (material.ProjectAPI,):   # write-only in this mode too
         assert [verb for verb in ("get", "post", "delete", "patch") if hasattr(handler, verb)] == []
@@ -1277,9 +1277,11 @@ def test_the_owners_list_is_metadata_without_operators_or_approvals(w):
 
 @pytest.mark.parametrize("query", [{}, {"mine": "false"}, {"mine": "1"}, {"mine": "TRUE"}])
 def test_the_owners_list_needs_mine_true(w, query):
+    """Anything but ``mine=true`` is the project list of #7269 (the project's admins, governance enforced), never the
+    owner's list: here, with no elitea_core to say whether governance is enforced, it is refused fail closed."""
     w.personal()
     body, status = mine(w, OWNER, **query)
-    assert (status, body["code"]) == (400, "INVALID_REQUEST")
+    assert (status, body["code"]) == (503, "DEPENDENCY_UNAVAILABLE") and "rows" not in body
 
 
 def test_the_owners_list_cannot_be_widened_by_the_filters_it_shares_with_the_operator_list(w):
