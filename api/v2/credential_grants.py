@@ -16,7 +16,8 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         parameters=[_PROJECT, *api.list_parameters(
             queries.GRANT_SORTS,
             ("state", "string", GRANT_STATES), ("agent_binding_ref", "string", None),
-            ("credential_ref", "string", None), ("toolkit_id", "integer", None), ("subject_user_id", "integer", None))],
+            ("credential_ref", "string", None), ("toolkit_id", "integer", None), ("subject_user_id", "integer", None),
+            ("escalated", "boolean", None))],
         mcp_tool=False,
         available_to_users=False,
     )
@@ -38,9 +39,42 @@ class AdminAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
         return api.respond(self.module, api.create_grant, project_id)
 
 
+class ProjectAPI(api_tools.APIModeHandler):  # pylint: disable=C0111
+    @register_openapi(
+        name="List Credential Grants (Project)",
+        description="The project's credential use grants for its own admins (credentials.view in the project), each "
+                    "row saying whether it is escalated. Only while governance is enforced.",
+        parameters=[_PROJECT, *api.list_parameters(
+            queries.GRANT_SORTS,
+            ("state", "string", GRANT_STATES), ("agent_binding_ref", "string", None),
+            ("credential_ref", "string", None), ("toolkit_id", "integer", None), ("subject_user_id", "integer", None),
+            ("escalated", "boolean", None))],
+        mcp_tool=False,
+        available_to_users=False,
+    )
+    @auth.decorators.check_api({"permissions": [api.VIEW], "recommended_roles": api.PROJECT_VIEW_ROLES})
+    def get(self, project_id: int, **kwargs):  # pylint: disable=C0111
+        return api.respond_in_project(self.module, api.VIEW, lambda pid: api.list_grants(pid, True), project_id)
+
+    @register_openapi(
+        name="Create Credential Grant (Project)",
+        description="Create a credential use grant in the project (credentials.manage in the project), as the "
+                    "administration route does; it starts pending and needs another approver. Only while governance "
+                    "is enforced.",
+        parameters=[_PROJECT],
+        request_body=api.GrantCreate,
+        mcp_tool=False,
+        available_to_users=False,
+    )
+    @auth.decorators.check_api({"permissions": [api.MANAGE], "recommended_roles": api.OPERATE_ROLES})
+    def post(self, project_id: int, **kwargs):  # pylint: disable=C0111
+        return api.respond_in_project(self.module, api.MANAGE, api.create_grant, project_id)
+
+
 class API(api_tools.APIBase):  # pylint: disable=R0903,C0111
     url_params = api_tools.with_modes(['<int:project_id>'])
 
     mode_handlers = {
         c.ADMINISTRATION_MODE: AdminAPI,
+        c.DEFAULT_MODE: ProjectAPI,
     }

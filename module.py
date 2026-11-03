@@ -79,10 +79,11 @@ class Module(module.ModuleModel):
         # Credential governance (#6757, C-1009). Registered whatever the governance flag says, so roles can
         # be assigned before it is switched on. Only credentials.use is evaluated by the admission layer;
         # reveal exists for a later governed reveal and is recommended to nobody, and no route reads it.
-        # view, manage, probe and approve are what the operator REST API (#7119) checks, in administration mode.
+        # view, manage, probe and approve are what the operator REST API (#7119) checks, in administration mode, and
+        # (#7269) in project mode for the project's admins.
         from .utils import credential_api  # pylint: disable=C0415
         for permission, roles in (
-                (credential_api.VIEW, credential_api.VIEW_ROLES),
+                (credential_api.VIEW, credential_api.PROJECT_VIEW_ROLES),   # (#7269) and the project's admins
                 (credential_api.MANAGE, credential_api.OPERATE_ROLES),
                 (credential_api.PROBE, credential_api.OPERATE_ROLES),
                 (credential_api.APPROVE, credential_api.OPERATE_ROLES),
