@@ -14,7 +14,7 @@ import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, ClassVar, Dict, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 from flask import request
 from pydantic.v1 import (
@@ -420,6 +420,21 @@ class GrantCreate(_Body):
 
 class GrantAction(_Approval):
     allowed_actions: ClassVar[tuple] = tuple(GRANT_ACTION_PERMISSION)
+    # (#7269) batch granting on approval: the same use for these members too, and/or every holder of a project role
+    also_grant_to: Optional[List[StrictInt]] = None
+    also_grant_role: Optional[StrictStr] = None
+
+    @validator("also_grant_to")
+    def _members(cls, value):  # pylint: disable=E0213
+        if value is not None and (len(value) > 100 or any(not 0 < item <= MAX_INT32 for item in value)):
+            raise ValueError("bad members")
+        return value
+
+    @root_validator
+    def _batch_only_for_approve(cls, values):  # pylint: disable=E0213
+        if (values.get("also_grant_to") or values.get("also_grant_role")) and values.get("action") != "approve":
+            raise ValueError("only approve grants to others")
+        return values
 
 
 def parse_body(model, data):
@@ -617,8 +632,17 @@ def create_grant(project_id):
 def grant_action(project_id, grant_id, mode=None):
     body = parse_body(GrantAction, read_json_object())
     require_permission(GRANT_ACTION_PERMISSION[body.action], project_id, mode)
+    if body.action == "approve" and (body.also_grant_to or body.also_grant_role):
+        from .credential_grant_batch import approve_with_siblings  # pylint: disable=C0415
+        return result_reply(approve_with_siblings(
+            project_id, grant_id, {"approval_ref": body.approval_ref, "policy_revision": body.policy_revision},
+            actor_id(), body.also_grant_to or (), body.also_grant_role))
     values = {"project_id": project_id, "action": body.action, "dry_run": False,
               **grant_key_by_id(project_id, grant_id)}
     if body.action == "approve":
         values.update(approval_ref=body.approval_ref, policy_revision=body.policy_revision)
-    return result_reply(run_grant_action(values, actor_id(), audit_code=True))
+    result = run_grant_action(values, actor_id(), audit_code=True)
+    if body.action == "approve" and result.get("error") is None:   # (#7269) the owner's consent, where it is needed
+        from .credential_grant_batch import notify_consent  # pylint: disable=C0415
+        notify_consent(project_id, grant_id)
+    return result_reply(result)

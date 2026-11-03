@@ -15,6 +15,7 @@ the ``grant_subject_user_id`` step: additive like ``written_by``, applied by the
 The grants list index (``ix_credential_use_grant_list``: project, target, updated_at; #7294) is the ``grant_list_index``
 step: additive, built where it is missing by the startup safety net and by the task, waiting at most ``LOCK_TIMEOUT``.
 """
+import contextvars
 import time
 from contextlib import contextmanager
 
@@ -149,9 +150,19 @@ def _add_written_by(connection, present_columns):
     _add_integer_column(connection, CredentialReference.__table__, WRITTEN_BY, present_columns)
 
 
+# (#7269) a member's batch request: the one session the batch's items share (elitea_core ``governance_requests``), whose
+# commit is a flush; set by ``credential_requests.file_requests`` for its project only
+_SHARED_SESSION = contextvars.ContextVar("credential_shared_session", default=None)
+
+
 @contextmanager
 def project_tx(project_id):
-    """A session on one project's schema that rolls back on any failure. Callers commit explicitly."""
+    """A session on one project's schema that rolls back on any failure. Callers commit explicitly. Inside a batch
+    request (#7269) it is the batch's own session: what the caller writes lands in the batch's one transaction."""
+    shared = _SHARED_SESSION.get()
+    if shared is not None and shared[0] == project_id:
+        yield shared[1]
+        return
     with db.get_session(project_id) as session:
         try:
             yield session
