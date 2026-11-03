@@ -80,7 +80,7 @@ STATUS = {
           "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER",
           "INVALID_DESCRIPTOR", "UNSUPPORTED_PROVIDER"),
     403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC", "OWNER_ONLY",
-          "DELEGATED_OWNER_PROBE", "TOKEN_SCOPE_OPERATION"),
+          "DELEGATED_OWNER_PROBE", "TOKEN_SCOPE_OPERATION", "RESUME_NEEDS_OPERATOR"),
     404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
@@ -214,6 +214,15 @@ def project_admins(project_id):
         return frozenset(this.for_module("elitea_core").module.governance_project_admins(project_id))
     except Exception:  # pylint: disable=W0703
         raise CredentialTaskError("DEPENDENCY_UNAVAILABLE") from None
+
+
+def refuse_foreign_resume(project_id, kind, row_id):
+    """(#7269) In project mode a suspended reference or grant is resumed only when an admin of the project suspended
+    it: what a platform operator (anyone who is not an admin of the project) suspended is resumed in administration
+    only (``RESUME_NEEDS_OPERATOR``). Another state is left to the lifecycle's own answer."""
+    state, changed_by = queries.state_change(project_id, kind, row_id)
+    if state == "suspended" and (changed_by is None or changed_by not in project_admins(project_id)):
+        raise CredentialTaskError("RESUME_NEEDS_OPERATOR")
 
 
 def inbox_filters(project_id, args, always=False):
@@ -562,6 +571,8 @@ def create_reference(project_id):
 def reference_action(project_id, ref_id, mode=None):
     body = parse_body(ReferenceAction, read_json_object())
     require_permission(REFERENCE_ACTION_PERMISSION[body.action], project_id, mode)
+    if mode == c.DEFAULT_MODE and body.action == "resume":
+        refuse_foreign_resume(project_id, "reference", ref_id)
     values = {"project_id": project_id, "action": body.action, "ref": str(ref_id), "dry_run": False}
     if body.action == "approve":
         values.update(approval_ref=body.approval_ref, policy_revision=body.policy_revision)
@@ -632,6 +643,8 @@ def create_grant(project_id):
 def grant_action(project_id, grant_id, mode=None):
     body = parse_body(GrantAction, read_json_object())
     require_permission(GRANT_ACTION_PERMISSION[body.action], project_id, mode)
+    if mode == c.DEFAULT_MODE and body.action == "resume":
+        refuse_foreign_resume(project_id, "grant", grant_id)
     if body.action == "approve" and (body.also_grant_to or body.also_grant_role):
         from .credential_grant_batch import approve_with_siblings  # pylint: disable=C0415
         return result_reply(approve_with_siblings(

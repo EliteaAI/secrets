@@ -21,11 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_7119_credential_api import APPROVER, CREATOR, MEMBER, P1, P2, TOOLKIT, Rest, app
 
 ADMINISTRATION, DEFAULT = "administration", "default"
-VIEWER, FOREIGN, PLATFORM = 40, 50, 60
+VIEWER, FOREIGN, PLATFORM, SYSTEM = 40, 50, 60, 70
 ROLES = {  # user -> {project id or "administration": role}
     # the two project admins are platform operators too, so the setup can use the administration routes of #7119
     CREATOR: {P1: "admin", ADMINISTRATION: "admin"}, APPROVER: {P1: "admin", ADMINISTRATION: "admin"}, MEMBER: {P1: "editor"}, VIEWER: {P1: "viewer"},
-    FOREIGN: {P2: "admin"}, PLATFORM: {ADMINISTRATION: "admin"},
+    FOREIGN: {P2: "admin"}, PLATFORM: {ADMINISTRATION: "admin"}, SYSTEM: {P1: "system"},   # the project's system user
 }
 APPROVAL = {"approval_ref": "CHG-7269", "policy_revision": "rev-1"}
 OFF = ({"error": "Project governance applies only while credential governance is enforced; nothing was changed.",
@@ -159,6 +159,59 @@ def test_the_project_mode_authorization_matrix(rest, route, actor, may_read, may
         assert len(rest.events()) == before
 
 
+def _action(name, row, action, **extra):
+    return lambda rest, actor, ids: rest.project(name, "post", P1, uuid.UUID(ids[row]), actor=actor,
+                                                 body={"action": action, **extra})
+
+
+ACTIONS = {  # (S-7) every lifecycle action in project mode, for each caller who must be refused
+    "reference_approve": _action("credential_reference_action", "validated", "approve", **APPROVAL),
+    "reference_activate": _action("credential_reference_action", "approved", "activate"),
+    "reference_suspend": _action("credential_reference_action", "ref", "suspend"),
+    "reference_resume": _action("credential_reference_action", "suspended_ref", "resume"),
+    "grant_approve": _action("credential_grant_action", "pending_grant", "approve", **APPROVAL),
+    "grant_suspend": _action("credential_grant_action", "grant", "suspend"),
+    "grant_resume": _action("credential_grant_action", "suspended_grant", "resume"),
+}
+
+
+def _action_ids(rest):
+    ids = _ids(rest)
+    ids["validated"] = rest.new_ref(P1, until="validated")
+    ids["approved"] = rest.new_ref(P1, until="approved")
+    ids["suspended_ref"] = rest.new_ref(P1, until="active")
+    assert rest.ref_action(ids["suspended_ref"], "suspend")[1] == 200
+    other = rest.seed_binding(application_id=7, version_id=11, tools=(43,))
+    ids["pending_grant"] = rest.grants.manage_grant(
+        f"project_id={P1};action=create;binding_ref={other};toolkit_id=43;ref={ids['ref']};subject_ref=idp:t1:o30",
+        PLATFORM)["grant"]
+    third = rest.seed_binding(application_id=8, version_id=12, tools=(44,))
+    key = f"project_id={P1};binding_ref={third};toolkit_id=44;ref={ids['ref']};subject_ref=idp:t1:o30"
+    ids["suspended_grant"] = rest.grants.manage_grant(f"{key};action=create", PLATFORM)["grant"]
+    for step, actor in (("action=approve;approval_ref=A;policy_revision=B", CREATOR), ("action=suspend", CREATOR)):
+        assert "error" not in rest.grants.manage_grant(f"{key};{step}", actor)
+    return ids
+
+
+@pytest.mark.parametrize("route", sorted(ACTIONS))
+@pytest.mark.parametrize("actor", [MEMBER, VIEWER, FOREIGN, PLATFORM, SYSTEM, 0])
+def test_every_lifecycle_action_refuses_who_is_not_an_admin_of_the_project(rest, route, actor):
+    ids = _action_ids(rest)
+    before = (len(rest.events()), sorted(row["state"] for row in rest.list_refs()[0]["rows"]),
+              sorted(row["state"] for row in rest.list_grants()[0]["rows"]))
+    payload, status = ACTIONS[route](rest, actor, ids)
+    assert (status, payload.get("error")) == (403, "access_denied"), (route, actor, payload)
+    assert (len(rest.events()), sorted(row["state"] for row in rest.list_refs()[0]["rows"]),
+            sorted(row["state"] for row in rest.list_grants()[0]["rows"])) == before
+
+
+@pytest.mark.parametrize("route", sorted(ACTIONS))
+def test_every_lifecycle_action_is_open_to_the_projects_admins(rest, route):
+    ids = _action_ids(rest)
+    payload, status = ACTIONS[route](rest, APPROVER, ids)
+    assert status == 200, (route, payload)
+
+
 @pytest.mark.parametrize("route", sorted(ROUTES))
 def test_the_gates_refusal_is_the_answer_and_nothing_is_read(rest, route):
     """Off and audit only (and an unscoped API token, which the gate refuses with its own code): elitea_core's answer,
@@ -265,3 +318,72 @@ def test_the_escalation_rule():
     assert inbox.escalated(frozenset(), 3) and inbox.escalated({3}, 3, None) and not inbox.escalated({3, 4}, 3)
     assert inbox.reference_waiting("validated", None) and not inbox.reference_waiting("validated", 7)
     assert not inbox.reference_waiting("active", None)
+
+
+# --- resume of what a platform operator suspended (D-3) ----------------------------------------------------------
+
+def _suspended_by(rest, actor, mode):
+    ids = _ids(rest)
+    for name, row in (("credential_reference_action", ids["ref"]), ("credential_grant_action", ids["grant"])):
+        payload, status = rest.project(name, "post", P1, uuid.UUID(row), actor=actor, mode=mode,
+                                       body={"action": "suspend"})
+        assert status == 200, payload
+    return ids
+
+
+def test_a_project_admin_cannot_resume_what_a_platform_operator_suspended(rest):
+    ids = _suspended_by(rest, PLATFORM, ADMINISTRATION)
+    events = len(rest.events())
+    for name, row in (("credential_reference_action", ids["ref"]), ("credential_grant_action", ids["grant"])):
+        payload, status = rest.project(name, "post", P1, uuid.UUID(row), actor=APPROVER, body={"action": "resume"})
+        assert (status, payload["code"]) == (403, "RESUME_NEEDS_OPERATOR"), payload
+    assert len(rest.events()) == events
+    assert {row["state"] for row in rest.list_refs()[0]["rows"]} == {"suspended"}
+    # administration mode keeps resume
+    for name, row in (("credential_reference_action", ids["ref"]), ("credential_grant_action", ids["grant"])):
+        payload, status = rest.project(name, "post", P1, uuid.UUID(row), actor=PLATFORM, mode=ADMINISTRATION,
+                                       body={"action": "resume"})
+        assert (status, payload["state"]) == (200, "active"), payload
+
+
+def test_a_project_admin_resumes_what_an_admin_of_the_project_suspended(rest):
+    ids = _suspended_by(rest, CREATOR, DEFAULT)
+    for name, row in (("credential_reference_action", ids["ref"]), ("credential_grant_action", ids["grant"])):
+        payload, status = rest.project(name, "post", P1, uuid.UUID(row), actor=APPROVER, body={"action": "resume"})
+        assert (status, payload["state"]) == (200, "active"), payload
+
+
+def test_who_is_no_longer_an_admin_counts_as_an_operator(rest):
+    ids = _suspended_by(rest, CREATOR, DEFAULT)
+    rest.admins[P1] = frozenset({APPROVER})
+    payload, status = rest.project("credential_grant_action", "post", P1, uuid.UUID(ids["grant"]), actor=APPROVER,
+                                   body={"action": "resume"})
+    assert (status, payload["code"]) == (403, "RESUME_NEEDS_OPERATOR")
+
+
+# --- the approver is never a sibling (M-1), project mode ---------------------------------------------------------
+
+def _batch_roles(rest, monkeypatch):
+    monkeypatch.setattr(StubAuth, "list_project_roles", staticmethod(
+        lambda project_id: [{"id": 1, "name": "editor"}, {"id": 2, "name": "admin"}]), raising=False)
+
+
+def test_in_project_mode_the_approver_named_as_a_sibling_is_refused(rest, monkeypatch):
+    _batch_roles(rest, monkeypatch)
+    grant = pending_grant(rest, CREATOR)
+    events = len(rest.events())
+    payload, status = rest.project("credential_grant_action", "post", P1, uuid.UUID(grant), actor=APPROVER,
+                                   body={"action": "approve", "also_grant_to": [APPROVER], **APPROVAL})
+    assert (status, payload["code"]) == (403, "SELF_APPROVAL")
+    assert len(rest.events()) == events
+    assert [row["state"] for row in rest.list_grants()[0]["rows"]] == ["pending_approval"]
+
+
+def test_in_project_mode_a_role_skips_the_approver(rest, monkeypatch):
+    _batch_roles(rest, monkeypatch)
+    grant = pending_grant(rest, CREATOR)
+    payload, status = rest.project("credential_grant_action", "post", P1, uuid.UUID(grant), actor=APPROVER,
+                                   body={"action": "approve", "also_grant_role": "editor", **APPROVAL})
+    assert status == 200, payload
+    assert APPROVER in payload["skipped"] and len(payload["siblings"]) == 1
+    assert APPROVER not in {row["subject"]["user"]["id"] for row in rest.list_grants()[0]["rows"]}

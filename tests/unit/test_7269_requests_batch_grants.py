@@ -42,8 +42,9 @@ def rest(gov, monkeypatch):
         module=types.SimpleNamespace(context=types.SimpleNamespace(event_manager=types.SimpleNamespace(
             fire_event=lambda name, payload: rest.fired.append((name, payload))))),
         for_module=lambda name: types.SimpleNamespace(descriptor=types.SimpleNamespace(config={
-            "mandate_identity_sources": list(rest.sources)})))
-    rest.sources = []
+            "mandate_identity_sources": list(rest.sources)}), module=types.SimpleNamespace(
+                governance_profile=types.SimpleNamespace(enabled=rest.governed))))
+    rest.sources, rest.governed = [], True
     monkeypatch.setattr(rest.batch, "this", fake_this)
     return rest
 
@@ -137,14 +138,47 @@ def test_the_approver_grants_the_same_use_to_other_members_in_one_transaction(re
         "active", MEMBER, APPROVER, "CHG-7269")
     codes = [event["reason_code"] for event in rest.events()]
     assert codes.count("GRANT_ACTIVE") == 2 and codes.count("GRANT_BATCH_SIBLING") == 1
+    # (D-2) the sibling's lifecycle events name the batch, whose GRANT_BATCH_SIBLING names the approver
+    sibling_events = [event for event in rest.events() if event.get("user_ref") == "idp:t1:o10"]
+    assert {event["reason_code"]: event["caller_ref"] for event in sibling_events} == {
+        "GRANT_PENDING_APPROVAL": f"batch:{grant}", "GRANT_ACTIVE": f"batch:{grant}",
+        "GRANT_BATCH_SIBLING": f"operator:{APPROVER}"}
+    original = [event for event in rest.events() if event.get("user_ref") == "idp:t1:o30"]
+    assert {event["caller_ref"] for event in original} == {f"operator:{MEMBER}", f"operator:{APPROVER}"}
 
 
 def test_a_role_grants_to_its_members_and_skips_who_cannot_hold_a_grant(rest):
     grant, *_ = requested_grant(rest)
     body, status = rest.grant_action(grant, "approve", actor=APPROVER, also_grant_role="editor", **APPROVAL)
     assert status == 200, body
-    assert MEMBER in body["skipped"] and UNLINKED in body["skipped"]   # already holds it; no linked sign-in
-    assert len(body["siblings"]) == 2   # the creator and the approver (any member may be granted to)
+    # already holds it; no linked sign-in; the approver, who never grants a use to themselves (M-1)
+    assert set(body["skipped"]) == {MEMBER, UNLINKED, APPROVER}
+    assert len(body["siblings"]) == 1   # the creator only
+    holders = {row["subject"]["user"]["id"] for row in rest.list_grants()[0]["rows"]}
+    assert holders == {MEMBER, CREATOR}
+
+
+def test_the_approver_named_as_a_sibling_is_refused_and_nothing_is_written(rest):
+    grant, *_ = requested_grant(rest)
+    before = rest.events()
+    body, status = rest.grant_action(grant, "approve", actor=APPROVER, also_grant_to=[CREATOR, APPROVER], **APPROVAL)
+    assert (status, body["code"]) == (403, "SELF_APPROVAL")
+    page = rest.list_grants()[0]
+    assert page["total"] == 1 and page["rows"][0]["state"] == "pending_approval"
+    assert rest.events() == before and rest.fired == []
+
+
+def test_the_cap_is_applied_before_any_subject_is_looked_up(rest, monkeypatch):
+    grant, *_ = requested_grant(rest)
+    queries = rest.gov.module("utils.credential_queries")
+    looked_up = []
+    real = queries.subject_ref_of_user
+    monkeypatch.setattr(queries, "subject_ref_of_user", lambda user_id: looked_up.append(user_id) or real(user_id))
+    monkeypatch.setattr(rest.batch, "MAX_SIBLINGS", 2)
+    rest.members = [CREATOR, APPROVER, MEMBER, UNLINKED, 70, 71]   # 4 candidates: not MEMBER (holds it), not APPROVER
+    body, status = rest.grant_action(grant, "approve", actor=APPROVER, also_grant_role="editor", **APPROVAL)
+    assert (status, body["code"]) == (400, "INVALID_REQUEST") and looked_up == []
+    assert rest.list_grants()[0]["rows"][0]["state"] == "pending_approval"
 
 
 def test_a_sibling_that_fails_rolls_the_approval_back(rest):
@@ -213,3 +247,16 @@ def test_a_stored_secret_asks_nobody(rest):
     rest.sources = ["token_owner_delegated"]
     rest.grant_action(grant, "approve", actor=APPROVER, **APPROVAL)
     assert rest.fired == []
+
+
+def test_off_and_audit_only_an_approval_reads_nothing_more_and_notifies_nobody(rest, monkeypatch):
+    """(S-5) Administration approve under off: no consent notice and no extra read (the platform as it was)."""
+    binding = rest.seed_binding()
+    ref = str(rest.gov.add_reference(P1, state="active", auth_mode="entra_delegated"))
+    body, _ = rest.create_grant(binding, ref, subject_user_id=MEMBER, actor=MEMBER)
+    rest.sources, rest.governed = ["token_owner_delegated"], False
+    sessions = []
+    monkeypatch.setattr(rest.batch, "db", types.SimpleNamespace(get_session=lambda *a: sessions.append(a)))
+    assert rest.grant_action(body["id"], "approve", actor=APPROVER, **APPROVAL)[1] == 200
+    assert rest.fired == [] and sessions == []
+    assert rest.batch.notify_consent(P1, body["id"]) is False and sessions == []

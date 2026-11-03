@@ -165,6 +165,8 @@ def _check_owner(reference, values, mandate_owner):
 
 
 def _event(reason_code, values, actor, event_type="lifecycle", **fields):
+    if values.get("caller_ref"):   # (#7269) a sibling of a batch grant names its batch (``batch:<grant id>``)
+        fields = {"caller_ref": values["caller_ref"], **fields}
     return audit.build_event(
         event_type, reason_code, project_id=values["project_id"], actor_user_id=actor,
         credential_ref=values["ref"], agent_binding_ref=values["binding_ref"],

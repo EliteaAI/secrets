@@ -59,6 +59,8 @@ MESSAGES = {
     "NOT_FOUND": "The project does not exist.",
     "AUDIT_UNAVAILABLE": "The audit trail is unavailable.",
     # project mode (#7269)
+    "RESUME_NEEDS_OPERATOR": "It was suspended by someone who is not an admin of this project; a platform operator "
+                             "resumes it. Nothing was changed.",
     "NO_SIBLINGS": "A personal credential, or a mandate's grant, is granted to its owner only; nothing was changed.",
     "PROJECT_GOVERNANCE_OFF": "Project governance applies only while credential governance is enforced; nothing was "
                               "changed.",

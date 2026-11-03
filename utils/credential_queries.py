@@ -401,6 +401,18 @@ def reference_custody(project_id, ref_id):
     return row.ownership_class, _owner_id(row.custodian_ref)
 
 
+def state_change(project_id, kind, row_id):
+    """``(state, state_changed_by)`` of one reference or grant of the project (#7269); another project's row is not
+    found, like an unknown one."""
+    model, missing = (_REF, "REFERENCE_NOT_FOUND") if kind == "reference" else (_GRANT, "GRANT_NOT_FOUND")
+    with project_tx(project_id) as session:
+        row = session.execute(select(model.state, model.state_changed_by).where(
+            model.id == uuid.UUID(str(row_id)), model.project_id == project_id)).first()
+    if row is None:
+        raise CredentialTaskError(missing)
+    return row.state, row.state_changed_by
+
+
 def reference_detail(project_id, ref_id):
     """One reference of the project with the number of live grants on it and whether a store write is in flight."""
     ref_uuid = uuid.UUID(str(ref_id))
