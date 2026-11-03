@@ -74,7 +74,7 @@ def approve_with_siblings(project_id, grant_id, approval, actor, user_ids=(), ro
         grant = raw.execute(select(CredentialUseGrant).where(CredentialUseGrant.id == uuid.UUID(str(grant_id)))).scalar_one()
         reference = raw.get(CredentialReference, grant.credential_ref)
         if grant.subject_kind == "mandate" or reference is None or reference.ownership_class == "personal":
-            raise CredentialTaskError("PERSONAL_ONLY")   # a personal credential or a mandate's grant has no siblings
+            raise CredentialTaskError("NO_SIBLINGS")   # a personal credential or a mandate's grant has no siblings
         requester, valid_until = grant.created_by, grant.valid_until
         existing = set(raw.execute(select(CredentialUseGrant.subject_user_id).where(
             CredentialUseGrant.agent_binding_ref == grant.agent_binding_ref,

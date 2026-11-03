@@ -59,6 +59,7 @@ MESSAGES = {
     "NOT_FOUND": "The project does not exist.",
     "AUDIT_UNAVAILABLE": "The audit trail is unavailable.",
     # project mode (#7269)
+    "NO_SIBLINGS": "A personal credential, or a mandate's grant, is granted to its owner only; nothing was changed.",
     "PROJECT_GOVERNANCE_OFF": "Project governance applies only while credential governance is enforced; nothing was "
                               "changed.",
     "TOKEN_SCOPE_OPERATION": "Project governance needs your own signed-in session or a scoped API token with the admin "

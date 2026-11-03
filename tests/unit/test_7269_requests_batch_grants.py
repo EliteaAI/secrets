@@ -168,7 +168,7 @@ def test_a_personal_credential_has_no_siblings_and_others_than_approve_take_none
     body, status = rest.create_grant(binding, ref, subject_user_id=MEMBER, actor=MEMBER)
     assert status == 201, body
     reply = rest.grant_action(body["id"], "approve", actor=APPROVER, also_grant_to=[CREATOR], **APPROVAL)
-    assert reply[1] == 409 and reply[0]["code"] == "PERSONAL_ONLY"
+    assert reply[1] == 409 and reply[0]["code"] == "NO_SIBLINGS"
     assert rest.grant_action(body["id"], "suspend", also_grant_to=[CREATOR])[1] == 400
 
 
