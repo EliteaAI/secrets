@@ -58,6 +58,11 @@ MESSAGES = {
     "INVALID_TRANSITION": "This change is not allowed from the current state.",
     "NOT_FOUND": "The project does not exist.",
     "AUDIT_UNAVAILABLE": "The audit trail is unavailable.",
+    # project mode (#7269)
+    "PROJECT_GOVERNANCE_OFF": "Project governance applies only while credential governance is enforced; nothing was "
+                              "changed.",
+    "TOKEN_SCOPE_OPERATION": "Project governance needs your own signed-in session or a scoped API token with the admin "
+                             "operation.",
     "FAILED": "The request failed.",
 }
 

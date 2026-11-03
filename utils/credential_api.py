@@ -21,7 +21,7 @@ from pydantic.v1 import (
     BaseModel, Extra, SecretStr, StrictBool, StrictInt, StrictStr, ValidationError, root_validator, validator,
 )
 from pylon.core.tools import log
-from tools import auth, config as c
+from tools import auth, config as c, this
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from . import credential_queries as queries
@@ -41,10 +41,15 @@ VIEW, MANAGE, PROBE, APPROVE = "credentials.view", "credentials.manage", "creden
 SET_OWN_VALUE = "credentials.set_own_value"
 # ``system`` is named everywhere: the role model defaults it to true, and these permissions are for operators only
 _OPERATORS = {"system": False, "super_admin": True, "admin": True, "viewer": False, "editor": False}
-# Read access exists in administration mode only; the project (default) mode has no handler in slice 1
+# Read access in administration mode; in the project (default) mode the administration handlers recommend nobody
 VIEW_ROLES = {
     "administration": dict(_OPERATORS),
     "default": {"system": False, "super_admin": False, "admin": False, "viewer": False, "editor": False},
+}
+# (#7269) the project's own admins in project mode: what the module registers for view and the project routes recommend
+PROJECT_VIEW_ROLES = {
+    "administration": dict(_OPERATORS),
+    "default": {"system": False, "admin": True, "viewer": False, "editor": False},
 }
 # What the permission registry (module.py) and the handlers recommend for manage, probe and approve
 OPERATE_ROLES = {
@@ -75,14 +80,15 @@ STATUS = {
           "UNSUPPORTED_OWNERSHIP_CLASS", "TOOLKIT_NOT_IN_BINDING", "MANDATE_BINDING_MISMATCH", "OWNER_NOT_MEMBER",
           "INVALID_DESCRIPTOR", "UNSUPPORTED_PROVIDER"),
     403: ("FORBIDDEN", "SELF_APPROVAL", "ACTOR_REQUIRED", "STORE_DENIED", "DENIED_RBAC", "OWNER_ONLY",
-          "DELEGATED_OWNER_PROBE"),
+          "DELEGATED_OWNER_PROBE", "TOKEN_SCOPE_OPERATION"),
     404: ("NOT_FOUND", "REFERENCE_NOT_FOUND", "GRANT_NOT_FOUND", "CONFIGURATION_NOT_FOUND", "BINDING_NOT_FOUND",
           "MANDATE_NOT_FOUND", "SUBJECT_NOT_FOUND"),
     409: ("INVALID_STATE", "INVALID_TRANSITION", "CONCURRENT_CHANGE", "REFERENCE_EXISTS", "GRANT_EXISTS",
           "IMPORT_IN_FLIGHT", "CONFIGURATION_CHANGED", "MATERIAL_MISMATCH", "NO_SECRET_FIELDS", "SECRET_UNRESOLVED",
           "MANDATE_INACTIVE", "SUBJECT_UNLINKED", "STORE_VERSION_CONFLICT", "MIGRATION_REQUIRED", "OWNER_UNLINKED",
           "PERSONAL_ONLY", "USE_PERSONAL_VALUE", "SUBJECT_NOT_OWNER", "CHECK_CONNECTION_FAILED",
-          "DELEGATED_SECRET_PRESENT", "DELEGATED_NO_VALUE", "DELEGATION_PROBE_FAILED", "OAUTH_APP_UNAVAILABLE"),
+          "DELEGATED_SECRET_PRESENT", "DELEGATED_NO_VALUE", "DELEGATION_PROBE_FAILED", "OAUTH_APP_UNAVAILABLE",
+          "PROJECT_GOVERNANCE_OFF"),
     413: ("REQUEST_TOO_LARGE",),
     503: ("DEPENDENCY_UNAVAILABLE", "AUDIT_UNAVAILABLE", "CHECK_CONNECTION_REFUSED"),
 }
@@ -158,6 +164,20 @@ def respond(module, handler, project_id, *args):
         return error_reply("FAILED")
 
 
+def respond_in_project(module, permission, handler, project_id, *args):
+    """``respond`` for a project-mode route (#7269): the gate first (nothing is read under off and audit only), then
+    ``permission`` in the project when named (an action's own permission is asked by its handler)."""
+    refused = project_refusal()
+    if refused:
+        return refused
+    if permission is not None:
+        try:
+            require_permission(permission, project_id, c.DEFAULT_MODE)
+        except CredentialTaskError as exc:
+            return error_reply(exc.code)
+    return respond(module, handler, project_id, *args)
+
+
 # --- who is calling, and may they do this -------------------------------------------------------------------------
 
 def actor_id():
@@ -166,15 +186,43 @@ def actor_id():
     return user_id if isinstance(user_id, int) and not isinstance(user_id, bool) else 0
 
 
-def require_permission(permission, project_id):
-    """Fail closed: anything but a clear yes is ``FORBIDDEN``."""
+def require_permission(permission, project_id, mode=None):
+    """Fail closed: anything but a clear yes is ``FORBIDDEN``. ``mode``: administration unless given (the project mode
+    of #7269 passes its own)."""
     try:
-        current = auth.resolve_permissions(mode=c.ADMINISTRATION_MODE, project_id=project_id)
+        current = auth.resolve_permissions(mode=mode or c.ADMINISTRATION_MODE, project_id=project_id)
         allowed = auth.has_access(current, [permission])
     except Exception:  # pylint: disable=W0703
         allowed = False
     if not allowed:
         raise CredentialTaskError("FORBIDDEN")
+
+
+def project_refusal():
+    """None, or the refusal of a project-mode call (#7269), before anything is read: elitea_core's gate (governance
+    enforced, a signed-in user, an API token only when scoped). Without elitea_core: refused, fail closed."""
+    try:
+        refused = this.for_module("elitea_core").module.governance_project_refusal()
+    except Exception:  # pylint: disable=W0703
+        return error_reply("DEPENDENCY_UNAVAILABLE")
+    return refused or None
+
+
+def project_admins(project_id):
+    """The project's admins, for the inbox's escalation (elitea_core reads the membership)."""
+    try:
+        return frozenset(this.for_module("elitea_core").module.governance_project_admins(project_id))
+    except Exception:  # pylint: disable=W0703
+        raise CredentialTaskError("DEPENDENCY_UNAVAILABLE") from None
+
+
+def inbox_filters(project_id, args, always=False):
+    """``{admins, escalated_only}`` for a list that says which rows are escalated (``always``: a project-mode list) or
+    keeps those only (``escalated=true``); ``{}`` otherwise (the list as before, nothing more read)."""
+    only = args.get("escalated") == "true"
+    if not (always or only):
+        return {}
+    return {"admins": project_admins(project_id), "escalated_only": only}
 
 
 # --- request bodies ----------------------------------------------------------------------------------------------
@@ -474,9 +522,11 @@ def grant_filters(args):
 
 # --- handler bodies ----------------------------------------------------------------------------------------------
 
-def list_references(project_id):
+def list_references(project_id, project_mode=False):
     args = request.args
-    return queries.list_references(project_id, parse_page(args, queries.REFERENCE_SORTS), reference_filters(args)), 200
+    inbox = inbox_filters(project_id, args, always=project_mode)
+    return queries.list_references(project_id, parse_page(args, queries.REFERENCE_SORTS), reference_filters(args),
+                                   **inbox), 200
 
 
 def get_reference(project_id, ref_id):
@@ -494,9 +544,9 @@ def create_reference(project_id):
     return result_reply(run_reference_action(values, actor_id(), audit_code=True), created=True)
 
 
-def reference_action(project_id, ref_id):
+def reference_action(project_id, ref_id, mode=None):
     body = parse_body(ReferenceAction, read_json_object())
-    require_permission(REFERENCE_ACTION_PERMISSION[body.action], project_id)
+    require_permission(REFERENCE_ACTION_PERMISSION[body.action], project_id, mode)
     values = {"project_id": project_id, "action": body.action, "ref": str(ref_id), "dry_run": False}
     if body.action == "approve":
         values.update(approval_ref=body.approval_ref, policy_revision=body.policy_revision)
@@ -547,9 +597,10 @@ def list_own_references(project_id):
     return {"total": found["total"], "rows": [{key: row[key] for key in _OWN_REFERENCE_KEYS} for row in found["rows"]]}, 200
 
 
-def list_grants(project_id):
+def list_grants(project_id, project_mode=False):
     args = request.args
-    return queries.list_grants(project_id, parse_page(args, queries.GRANT_SORTS), grant_filters(args)), 200
+    inbox = inbox_filters(project_id, args, always=project_mode)
+    return queries.list_grants(project_id, parse_page(args, queries.GRANT_SORTS), grant_filters(args), **inbox), 200
 
 
 def create_grant(project_id):
@@ -563,9 +614,9 @@ def create_grant(project_id):
     return result_reply(run_grant_action(values, actor_id(), audit_code=True), created=True)
 
 
-def grant_action(project_id, grant_id):
+def grant_action(project_id, grant_id, mode=None):
     body = parse_body(GrantAction, read_json_object())
-    require_permission(GRANT_ACTION_PERMISSION[body.action], project_id)
+    require_permission(GRANT_ACTION_PERMISSION[body.action], project_id, mode)
     values = {"project_id": project_id, "action": body.action, "dry_run": False,
               **grant_key_by_id(project_id, grant_id)}
     if body.action == "approve":

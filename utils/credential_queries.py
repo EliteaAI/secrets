@@ -29,6 +29,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from tools import auth, config as c, this
 
 from ..models.credential_governance import CredentialReference, CredentialStoreLedger, CredentialUseGrant
+from . import credential_inbox as inbox
 from .credential_errors import CredentialTaskError
 from .credential_grants import _BINDING, ANY_TARGET, SUBJECT_PATTERN
 from .credential_schema import project_tx
@@ -351,9 +352,13 @@ def _present_references(rows):
     return present
 
 
-def list_references(project_id, page, filters):
-    """``{total, rows}`` of the project's references. ``filters``: state, ownership_class, store_kind, owner_user_id."""
+def list_references(project_id, page, filters, admins=None, escalated_only=False):
+    """``{total, rows}`` of the project's references. ``filters``: state, ownership_class, store_kind, owner_user_id.
+    ``admins`` (#7269): the project's admins; each row then says whether it is ``escalated`` (``credential_inbox``) and
+    ``escalated_only`` keeps those rows only. Without ``admins`` the rows are as before."""
     conditions = [_REF.project_id == project_id]
+    if admins is not None and escalated_only:
+        conditions.append(inbox.reference_clause(admins))
     for name in ("state", "ownership_class", "store_kind"):
         if filters.get(name):
             conditions.append(getattr(_REF, name) == filters[name])
@@ -377,7 +382,12 @@ def list_references(project_id, page, filters):
         return total, rows
 
     total, rows = _tolerating_missing_configuration(run)
-    return {"total": total, "rows": _present_references(rows)}
+    present = _present_references(rows)
+    if admins is not None:
+        for row, item in zip(rows, present):
+            item["escalated"] = inbox.reference_waiting(row.state, row.approved_by) and inbox.escalated(
+                admins, row.created_by, row.written_by)
+    return {"total": total, "rows": present}
 
 
 def reference_custody(project_id, ref_id):
@@ -535,11 +545,14 @@ def _present_grants(project_id, rows, known_subject=None):
     return present
 
 
-def list_grants(project_id, page, filters):
+def list_grants(project_id, page, filters, admins=None, escalated_only=False):
     """``{total, rows}`` of the project's grants. ``filters``: state, agent_binding_ref, credential_ref, toolkit_id,
-    subject_user_id (resolved to its subject here; a user that cannot have a subject has no grants)."""
+    subject_user_id (resolved to its subject here; a user that cannot have a subject has no grants). ``admins`` and
+    ``escalated_only`` (#7269): as ``list_references``."""
     # grants for any other target cannot be acted on by the lifecycle functions, so they are not listed
     conditions = [_GRANT.project_id == project_id, _GRANT.target_ref == ANY_TARGET]
+    if admins is not None and escalated_only:
+        conditions.append(inbox.grant_clause(admins))
     known_subject = None
     if filters.get("state"):
         conditions.append(_GRANT.state == filters["state"])
@@ -567,4 +580,8 @@ def list_grants(project_id, page, filters):
         rows = session.execute(
             select(*_GRANT_COLUMNS).where(*conditions).order_by(*_order(GRANT_SORTS, page, _GRANT))
             .limit(page.limit).offset(page.offset)).all()
-    return {"total": total, "rows": _present_grants(project_id, rows, known_subject)}
+    present = _present_grants(project_id, rows, known_subject)
+    if admins is not None:
+        for row, item in zip(rows, present):
+            item["escalated"] = row.state == "pending_approval" and inbox.escalated(admins, row.created_by)
+    return {"total": total, "rows": present}
