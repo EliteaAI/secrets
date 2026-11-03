@@ -274,6 +274,46 @@ def _move(values, actor):
 
 _ACTIONS = {"create": _create, "approve": _approve, "suspend": _move, "resume": _move, "revoke": _move}
 
+LIVE_GRANT_STATES_OF_BINDING = ("pending_approval", "active", "suspended")
+MAX_BINDING_GRANTS = 1000   # a binding's grants, revoked in one transaction; more is refused (nothing changed)
+
+
+BINDING_GRANT_REASONS = ("BINDING_RETIRED", "BINDING_REVIVED")
+
+
+def revoke_binding_grants(session, project_id, binding_id, actor, reason="BINDING_RETIRED") -> int:
+    """(#7228, C9-SEC-96) Revoke every live grant of a binding in ``session`` (the caller's transaction: its retirement
+    or its revival), each audited ``GRANT_REVOKED_<reason>`` (``BINDING_RETIRED`` / ``BINDING_REVIVED``). Returns how many were revoked. Raises
+    ``CredentialTaskError("INVALID_REQUEST")`` beyond ``MAX_BINDING_GRANTS``, and ``CONCURRENT_CHANGE`` when a grant
+    changed meanwhile: the caller rolls back, nothing is left half done."""
+    _require_actor_id(actor)
+    if reason not in BINDING_GRANT_REASONS:
+        raise CredentialTaskError("INVALID_REQUEST")
+    rows = session.execute(select(
+        CredentialUseGrant.id, CredentialUseGrant.state, CredentialUseGrant.application_id,
+        CredentialUseGrant.credential_ref, CredentialUseGrant.toolkit_instance_id, CredentialUseGrant.subject_ref,
+    ).where(
+        CredentialUseGrant.project_id == project_id, CredentialUseGrant.agent_binding_ref == uuid.UUID(str(binding_id)),
+        CredentialUseGrant.state.in_(LIVE_GRANT_STATES_OF_BINDING),
+    ).order_by(CredentialUseGrant.id).limit(MAX_BINDING_GRANTS + 1)).all()
+    if len(rows) > MAX_BINDING_GRANTS:
+        raise CredentialTaskError("INVALID_REQUEST")
+    for row in rows:
+        if not transition_grant(session, row.id, row.state, "revoked", actor=actor):
+            raise CredentialTaskError("CONCURRENT_CHANGE")
+        epoch = session.execute(select(CredentialUseGrant.revocation_epoch).where(
+            CredentialUseGrant.id == row.id)).scalar_one()
+        values = {"project_id": project_id, "ref": str(row.credential_ref), "binding_ref": str(binding_id),
+                  "toolkit_id": row.toolkit_instance_id, "subject_ref": row.subject_ref}
+        audit.record(session, _event(f"GRANT_REVOKED_{reason}", values, actor, application_id=row.application_id,
+                                     outcome="success", revocation_epoch=epoch))
+    return len(rows)
+
+
+def _require_actor_id(actor):
+    if isinstance(actor, bool) or not isinstance(actor, int) or actor <= 0:
+        raise CredentialTaskError("ACTOR_REQUIRED")
+
 
 def run_grant_action(values, actor_user_id=0, audit_code=False):
     """Run one grant action from parsed ``values`` (the admin task and the REST API both end here). Returns a

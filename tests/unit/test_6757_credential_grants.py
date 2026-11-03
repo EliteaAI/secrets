@@ -368,3 +368,43 @@ def test_an_existing_mandate_grant_can_still_be_revoked_after_its_mandate_is_rev
         session.execute(MANDATE.update().values(state="revoked"))
         session.commit()
     assert setup.run(APPROVER, action="revoke", subject_ref=subject)["state"] == "revoked"
+
+
+# --- (#7228, C9-SEC-96) a binding's retirement revokes its grants in the caller's transaction ------------------------
+
+def test_a_retired_bindings_live_grants_are_revoked_in_the_callers_session_and_audited(gov, setup, grants):
+    setup.active()
+    active = setup.grant_id
+    setup.create(subject_ref="idp:tenant-1:oid-2")   # a second one, still pending
+    other = add_binding(gov, version_id=10)
+    kept = setup.create(binding_ref=other)["grant"]   # another binding's grant is not touched
+    with gov.db.get_session(PROJECT) as session:
+        assert grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER) == 2
+        session.commit()
+    assert gov.grant(PROJECT, uuid.UUID(active)).state == "revoked"
+    assert gov.grant(PROJECT, uuid.UUID(active)).revocation_epoch == 1
+    assert gov.grant(PROJECT, uuid.UUID(setup.grant_id)).state == "pending_approval"   # the other binding's
+    assert gov.grant(PROJECT, uuid.UUID(kept)).state == "pending_approval"
+    revoked = [event for event in setup.events if event["reason_code"] == "GRANT_REVOKED_BINDING_RETIRED"]
+    assert len(revoked) == 2 and {event["agent_binding_ref"] for event in revoked} == {setup.binding}
+    with gov.db.get_session(PROJECT) as session:   # nothing left: a second call revokes nothing
+        assert grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER, "BINDING_REVIVED") == 0
+
+
+def test_revoking_a_bindings_grants_needs_an_operator_and_a_known_reason(gov, setup, grants):
+    setup.active()
+    with gov.db.get_session(PROJECT) as session:
+        for actor, reason in ((0, "BINDING_RETIRED"), (APPROVER, "SOMETHING")):
+            with pytest.raises(grants.CredentialTaskError):
+                grants.revoke_binding_grants(session, PROJECT, setup.binding, actor, reason)
+    assert setup.row.state == "active"
+
+
+def test_a_failed_audit_leaves_the_bindings_grants_to_the_callers_rollback(gov, setup, grants):
+    setup.active()
+    gov.tracing.fail = True
+    with gov.db.get_session(PROJECT) as session:
+        with pytest.raises(Exception):
+            grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER)
+        session.rollback()
+    assert setup.row.state == "active"
