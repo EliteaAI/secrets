@@ -275,7 +275,8 @@ def _move(values, actor):
 _ACTIONS = {"create": _create, "approve": _approve, "suspend": _move, "resume": _move, "revoke": _move}
 
 LIVE_GRANT_STATES_OF_BINDING = ("pending_approval", "active", "suspended")
-MAX_BINDING_GRANTS = 1000   # a binding's grants, revoked in one transaction; more is refused (nothing changed)
+BINDING_GRANT_PAGE = 500     # read and revoked a page at a time, all in the caller's transaction (#7228, D3-S3)
+MAX_BINDING_GRANTS = 50000   # beyond this a retirement is refused readably (TOO_MANY_GRANTS), nothing changed
 
 
 BINDING_GRANT_REASONS = ("BINDING_RETIRED", "BINDING_REVIVED")
@@ -284,20 +285,29 @@ BINDING_GRANT_REASONS = ("BINDING_RETIRED", "BINDING_REVIVED")
 def revoke_binding_grants(session, project_id, binding_id, actor, reason="BINDING_RETIRED") -> int:
     """(#7228, C9-SEC-96) Revoke every live grant of a binding in ``session`` (the caller's transaction: its retirement
     or its revival), each audited ``GRANT_REVOKED_<reason>`` (``BINDING_RETIRED`` / ``BINDING_REVIVED``). Returns how many were revoked. Raises
-    ``CredentialTaskError("INVALID_REQUEST")`` beyond ``MAX_BINDING_GRANTS``, and ``CONCURRENT_CHANGE`` when a grant
+    ``CredentialTaskError("TOO_MANY_GRANTS")`` beyond ``MAX_BINDING_GRANTS``, and ``CONCURRENT_CHANGE`` when a grant
     changed meanwhile: the caller rolls back, nothing is left half done."""
     _require_actor_id(actor)
     if reason not in BINDING_GRANT_REASONS:
         raise CredentialTaskError("INVALID_REQUEST")
-    rows = session.execute(select(
-        CredentialUseGrant.id, CredentialUseGrant.state, CredentialUseGrant.application_id,
-        CredentialUseGrant.credential_ref, CredentialUseGrant.toolkit_instance_id, CredentialUseGrant.subject_ref,
-    ).where(
-        CredentialUseGrant.project_id == project_id, CredentialUseGrant.agent_binding_ref == uuid.UUID(str(binding_id)),
-        CredentialUseGrant.state.in_(LIVE_GRANT_STATES_OF_BINDING),
-    ).order_by(CredentialUseGrant.id).limit(MAX_BINDING_GRANTS + 1)).all()
-    if len(rows) > MAX_BINDING_GRANTS:
-        raise CredentialTaskError("INVALID_REQUEST")
+    revoked = 0
+    while True:   # each page is revoked before the next is read, so the next one holds the rest
+        rows = session.execute(select(
+            CredentialUseGrant.id, CredentialUseGrant.state, CredentialUseGrant.application_id,
+            CredentialUseGrant.credential_ref, CredentialUseGrant.toolkit_instance_id, CredentialUseGrant.subject_ref,
+        ).where(
+            CredentialUseGrant.project_id == project_id,
+            CredentialUseGrant.agent_binding_ref == uuid.UUID(str(binding_id)),
+            CredentialUseGrant.state.in_(LIVE_GRANT_STATES_OF_BINDING),
+        ).order_by(CredentialUseGrant.id).limit(BINDING_GRANT_PAGE)).all()
+        if not rows:
+            return revoked
+        if revoked + len(rows) > MAX_BINDING_GRANTS:
+            raise CredentialTaskError("TOO_MANY_GRANTS")
+        revoked += _revoke_page(session, project_id, binding_id, actor, reason, rows)
+
+
+def _revoke_page(session, project_id, binding_id, actor, reason, rows) -> int:  # pylint: disable=R0913
     for row in rows:
         if not transition_grant(session, row.id, row.state, "revoked", actor=actor):
             raise CredentialTaskError("CONCURRENT_CHANGE")

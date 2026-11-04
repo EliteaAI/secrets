@@ -408,3 +408,28 @@ def test_a_failed_audit_leaves_the_bindings_grants_to_the_callers_rollback(gov, 
             grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER)
         session.rollback()
     assert setup.row.state == "active"
+
+
+def test_a_binding_with_more_grants_than_a_page_has_them_all_revoked_in_one_transaction(gov, setup, grants, monkeypatch):
+    """(#7228, D3-S3) a retirement is the safety action: more grants than a page are revoked page by page."""
+    monkeypatch.setattr(grants, "BINDING_GRANT_PAGE", 1)
+    setup.create()
+    setup.create(subject_ref="idp:tenant-1:oid-2")
+    setup.create(subject_ref="idp:tenant-1:oid-3")
+    with gov.db.get_session(PROJECT) as session:
+        assert grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER) == 3
+        session.commit()
+    assert {event["reason_code"] for event in setup.events if "REVOKED" in event["reason_code"]} == {
+        "GRANT_REVOKED_BINDING_RETIRED"}
+
+
+def test_beyond_the_ceiling_a_retirement_is_refused_readably(gov, setup, grants, monkeypatch):
+    monkeypatch.setattr(grants, "BINDING_GRANT_PAGE", 1)
+    monkeypatch.setattr(grants, "MAX_BINDING_GRANTS", 1)
+    setup.create()
+    setup.create(subject_ref="idp:tenant-1:oid-2")
+    with gov.db.get_session(PROJECT) as session:
+        with pytest.raises(grants.CredentialTaskError) as refused:
+            grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER)
+        session.rollback()
+    assert refused.value.code == "TOO_MANY_GRANTS"
