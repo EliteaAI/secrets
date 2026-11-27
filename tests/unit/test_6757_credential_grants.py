@@ -433,3 +433,29 @@ def test_beyond_the_ceiling_a_retirement_is_refused_readably(gov, setup, grants,
             grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER)
         session.rollback()
     assert refused.value.code == "TOO_MANY_GRANTS"
+
+
+def test_beyond_the_ceiling_nothing_is_revoked_before_the_refusal(gov, setup, grants, monkeypatch):
+    """(#7228, D4-S2) the ceiling is counted first: no grant changes and no revocation is audited before
+    ``TOO_MANY_GRANTS``, even before the caller rolls back."""
+    monkeypatch.setattr(grants, "BINDING_GRANT_PAGE", 1)
+    monkeypatch.setattr(grants, "MAX_BINDING_GRANTS", 2)
+    ids = [setup.create(subject_ref=f"idp:tenant-1:oid-{n}")["grant"] for n in range(3)]
+    with gov.db.get_session(PROJECT) as session:
+        with pytest.raises(grants.CredentialTaskError) as refused:
+            grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER)
+        assert refused.value.code == "TOO_MANY_GRANTS"
+        assert [event for event in setup.events if "REVOKED" in event["reason_code"]] == []
+        session.commit()   # nothing was written, so committing changes nothing
+    assert {gov.grant(PROJECT, uuid.UUID(grant_id)).state for grant_id in ids} == {"pending_approval"}
+
+
+def test_at_the_ceiling_every_grant_is_revoked(gov, setup, grants, monkeypatch):
+    monkeypatch.setattr(grants, "BINDING_GRANT_PAGE", 1)
+    monkeypatch.setattr(grants, "MAX_BINDING_GRANTS", 2)
+    setup.create()
+    setup.create(subject_ref="idp:tenant-1:oid-2")
+    with gov.db.get_session(PROJECT) as session:
+        assert grants.revoke_binding_grants(session, PROJECT, setup.binding, APPROVER) == 2
+        session.commit()
+
