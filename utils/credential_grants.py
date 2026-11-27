@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 
 from pylon.core.tools import log
-from sqlalchemy import Column, Integer, MetaData, String, Table, Uuid, select
+from sqlalchemy import Column, Integer, MetaData, String, Table, Uuid, func, select
 from sqlalchemy.exc import IntegrityError
 from tools import config as c
 
@@ -290,19 +290,25 @@ def revoke_binding_grants(session, project_id, binding_id, actor, reason="BINDIN
     _require_actor_id(actor)
     if reason not in BINDING_GRANT_REASONS:
         raise CredentialTaskError("INVALID_REQUEST")
+    live = (
+        CredentialUseGrant.project_id == project_id,
+        CredentialUseGrant.agent_binding_ref == uuid.UUID(str(binding_id)),
+        CredentialUseGrant.state.in_(LIVE_GRANT_STATES_OF_BINDING),
+    )
+    # the ceiling is checked before anything is revoked (D4-S2): a refused retirement writes nothing and holds the
+    # binding row for one capped count, not for every page revoked before the refusal
+    counted = select(CredentialUseGrant.id).where(*live).limit(MAX_BINDING_GRANTS + 1).subquery()
+    if session.execute(select(func.count()).select_from(counted)).scalar_one() > MAX_BINDING_GRANTS:
+        raise CredentialTaskError("TOO_MANY_GRANTS")
     revoked = 0
     while True:   # each page is revoked before the next is read, so the next one holds the rest
         rows = session.execute(select(
             CredentialUseGrant.id, CredentialUseGrant.state, CredentialUseGrant.application_id,
             CredentialUseGrant.credential_ref, CredentialUseGrant.toolkit_instance_id, CredentialUseGrant.subject_ref,
-        ).where(
-            CredentialUseGrant.project_id == project_id,
-            CredentialUseGrant.agent_binding_ref == uuid.UUID(str(binding_id)),
-            CredentialUseGrant.state.in_(LIVE_GRANT_STATES_OF_BINDING),
-        ).order_by(CredentialUseGrant.id).limit(BINDING_GRANT_PAGE)).all()
+        ).where(*live).order_by(CredentialUseGrant.id).limit(BINDING_GRANT_PAGE)).all()
         if not rows:
             return revoked
-        if revoked + len(rows) > MAX_BINDING_GRANTS:
+        if revoked + len(rows) > MAX_BINDING_GRANTS:   # grants added meanwhile: still refused, the caller rolls back
             raise CredentialTaskError("TOO_MANY_GRANTS")
         revoked += _revoke_page(session, project_id, binding_id, actor, reason, rows)
 
