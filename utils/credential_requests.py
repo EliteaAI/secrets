@@ -11,6 +11,7 @@ import uuid
 from . import credential_schema
 from .credential_errors import CredentialTaskError
 from .credential_grants import run_grant_action
+from .credential_delegation import AUTH_MODE as DELEGATED_AUTH_MODE
 from .credential_onboarding import run_reference_action
 
 STORE_KIND = "database"
@@ -27,6 +28,24 @@ def _uuid(value):
     return str(uuid.UUID(str(value)))
 
 
+def _reference_values(project_id, item, actor):
+    """A reference request: the member's own personal one by default. (#7228) The chat's credential form also asks for
+    a ``project_shared`` one (``pending``, ``created_by`` the member, approved later by a project admin like every
+    request) and for an Entra-delegated personal one (``auth_mode`` + ``delegation``, which stores nothing)."""
+    ownership = item.get("ownership_class", "personal")
+    delegated = item.get("auth_mode") is not None
+    if ownership not in ("personal", "project_shared") or (delegated and ownership != "personal") \
+            or (delegated and item.get("auth_mode") != DELEGATED_AUTH_MODE):
+        raise CredentialTaskError("INVALID_REQUEST")
+    values = {"project_id": project_id, "action": "create", "configuration_uuid": _uuid(item["configuration_uuid"]),
+              "store_kind": STORE_KIND, "ownership_class": ownership, "dry_run": False}
+    if ownership == "personal":
+        values["owner_user_id"] = actor
+    if delegated:
+        values.update(auth_mode=DELEGATED_AUTH_MODE, delegation=item.get("delegation"))
+    return values
+
+
 def file_requests(session, project_id, items, actor):
     """``[{key, id}]`` in order, or ``CredentialTaskError`` (the batch is then rolled back by its owner)."""
     if not isinstance(items, list) or len(items) > MAX_ITEMS or not isinstance(actor, int) or actor <= 0:
@@ -36,10 +55,7 @@ def file_requests(session, project_id, items, actor):
         filed = []
         for item in items:
             if item.get("kind") == "reference":
-                result = run_reference_action({
-                    "project_id": project_id, "action": "create", "configuration_uuid": _uuid(item["configuration_uuid"]),
-                    "store_kind": STORE_KIND, "ownership_class": "personal", "owner_user_id": actor, "dry_run": False,
-                }, actor, audit_code=True)
+                result = run_reference_action(_reference_values(project_id, item, actor), actor, audit_code=True)
                 identifier = result.get("reference")
             elif item.get("kind") == "grant":
                 subject = item.get("subject_ref")

@@ -13,6 +13,7 @@ MESSAGES = {
     "REFERENCE_EXISTS": "A live credential reference already exists for this configuration.",
     "GRANT_NOT_FOUND": "No such credential use grant in this project.",
     "GRANT_EXISTS": "This credential use grant already exists.",
+    "TOO_MANY_GRANTS": "The binding has more credential use grants than one retirement revokes; nothing was changed.",
     "CONFIGURATION_NOT_FOUND": "The configuration does not exist in this project.",
     "CONFIGURATION_CHANGED": "The configuration changed since its material was imported; import it again.",
     "CONFIGURATION_NOT_ELIGIBLE": "Only credentials of this project can be registered for governed use.",
